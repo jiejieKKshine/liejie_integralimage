@@ -2,7 +2,7 @@
  * IntegralImage 算子功能测试（aclnn 接口）
  *
  * 数据格式（同事确认版）：
- *   输入 image: (H,W) 或 (C,H,W)，uint8/int16/float16/float32，ND
+ *   输入 image: (H,W) 或 (H,W,C)，uint8/float16/float32，ND（HWC 布局）
  *   输出 sat  : (H+1,W+1) 或 (C,H+1,W+1)，int32（整数输入）/ float32（浮点输入）
  *
  * 验证点：
@@ -243,7 +243,7 @@ int RunAll(aclrtStream stream)
                 exp[i * (W + 1) + j] = static_cast<double>(i) * j;
             }
         }
-        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
     }
 
 #ifndef DUMP_SAT
@@ -262,7 +262,7 @@ int RunAll(aclrtStream stream)
                                        exp[(i - 1) * (W + 1) + j - 1] + in[(i - 1) * W + (j - 1)];
             }
         }
-        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
     }
 
     // 用例 3：float16 8x128 全 1.0（两级转换 fp16 -> fp32）
@@ -276,7 +276,7 @@ int RunAll(aclrtStream stream)
                 exp[i * (W + 1) + j] = static_cast<double>(i) * j;
             }
         }
-        ret = ret || RunCaseT<uint16_t, float>(stream, H, W, in, ACL_FLOAT16, ACL_FLOAT, exp);
+        ret |= RunCaseT<uint16_t, float>(stream, H, W, in, ACL_FLOAT16, ACL_FLOAT, exp);
     }
 
     // 用例 4：float32 8x128 伪随机（fp32 -> fp32）
@@ -294,7 +294,7 @@ int RunAll(aclrtStream stream)
                                        exp[(i - 1) * (W + 1) + j - 1] + in[(i - 1) * W + (j - 1)];
             }
         }
-        ret = ret || RunCaseT<float, float>(stream, H, W, in, ACL_FLOAT, ACL_FLOAT, exp);
+        ret |= RunCaseT<float, float>(stream, H, W, in, ACL_FLOAT, ACL_FLOAT, exp);
     }
 
     // 用例 5：float32 3D 2x8x128（HWC 逐通道独立）
@@ -319,7 +319,7 @@ int RunAll(aclrtStream stream)
                 }
             }
         }
-        ret = ret || RunCase3DT<float, float>(stream, C, H, W, in, ACL_FLOAT, ACL_FLOAT, exp);
+        ret |= RunCase3DT<float, float>(stream, C, H, W, in, ACL_FLOAT, ACL_FLOAT, exp);
     }
 
     // 用例 6：uint8 1x1（W<32 全尾部，DataCopyPad 路径）
@@ -333,7 +333,7 @@ int RunAll(aclrtStream stream)
                 exp[i * (W + 1) + j] = static_cast<double>(i) * j * 7;
             }
         }
-        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
     }
 
     // 用例 7：uint8 1x64（单行）
@@ -347,7 +347,7 @@ int RunAll(aclrtStream stream)
                 exp[i * (W + 1) + j] = static_cast<double>(i) * j * 3;
             }
         }
-        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
     }
 
     // 用例 8：uint8 8x1（单列，W<32）
@@ -365,7 +365,7 @@ int RunAll(aclrtStream stream)
                                        exp[(i - 1) * (W + 1) + j - 1] + in[(i - 1) * W + (j - 1)];
             }
         }
-        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
     }
 
     // 用例 9：uint8 257x513（大非对齐，单核全 DataCopyPad）
@@ -383,7 +383,43 @@ int RunAll(aclrtStream stream)
                                        exp[(i - 1) * (W + 1) + j - 1] + in[(i - 1) * W + (j - 1)];
             }
         }
-        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+    }
+
+    // 用例 10：uint8 8x2048（真多核：blockW=1024 => 2 核）
+    {
+        constexpr int64_t H = 8;
+        constexpr int64_t W = 2048;
+        std::vector<uint8_t> in(H * W);
+        for (int64_t i = 0; i < H * W; i++) {
+            in[i] = static_cast<uint8_t>((i * 3 + 11) % 233);
+        }
+        std::vector<double> exp((H + 1) * (W + 1), 0);
+        for (int64_t i = 1; i <= H; i++) {
+            for (int64_t j = 1; j <= W; j++) {
+                exp[i * (W + 1) + j] = exp[(i - 1) * (W + 1) + j] + exp[i * (W + 1) + j - 1] -
+                                       exp[(i - 1) * (W + 1) + j - 1] + in[(i - 1) * W + (j - 1)];
+            }
+        }
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+    }
+
+    // 用例 11：uint8 8x4097（4 核 + 尾部 1 列，多核非对齐）
+    {
+        constexpr int64_t H = 8;
+        constexpr int64_t W = 4097;
+        std::vector<uint8_t> in(H * W);
+        for (int64_t i = 0; i < H * W; i++) {
+            in[i] = static_cast<uint8_t>((i * 7 + 5) % 199);
+        }
+        std::vector<double> exp((H + 1) * (W + 1), 0);
+        for (int64_t i = 1; i <= H; i++) {
+            for (int64_t j = 1; j <= W; j++) {
+                exp[i * (W + 1) + j] = exp[(i - 1) * (W + 1) + j] + exp[i * (W + 1) + j - 1] -
+                                       exp[(i - 1) * (W + 1) + j - 1] + in[(i - 1) * W + (j - 1)];
+            }
+        }
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
     }
 
     return ret;

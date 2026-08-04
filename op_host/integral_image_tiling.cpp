@@ -79,6 +79,13 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
     }
     // 核数向上取整：最后一个核处理非 32 对齐的尾部（W<32 时单核全尾部）
     int32_t coreNum = static_cast<int32_t>((width + blockWidth - 1) / blockWidth);
+    // 限制到平台实际 AI Core 数；当前 kernel 每核单块，
+    // 若块数超过平台核数（W > coreNum*blockW）则超当前支持范围，报错
+    if (coreNum > coreNumAiv) {
+        OP_LOGE(context, "IntegralImage: W=%ld requires %d blocks > platform cores %ld (per-core multi-block not implemented)",
+                width, coreNum, coreNumAiv);
+        return ge::GRAPH_FAILED;
+    }
 
     IntegralImageTilingData* tiling = context->GetTilingData<IntegralImageTilingData>();
     OP_CHECK_NULL_WITH_CONTEXT(context, tiling);

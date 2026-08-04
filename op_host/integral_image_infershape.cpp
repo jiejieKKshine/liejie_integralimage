@@ -12,10 +12,10 @@
  * \file integral_image_infershape.cpp
  * \brief IntegralImage 输出 shape 推导
  *
- * 输出 sat 与输入 image 的 shape 关系：
+ * 输出 sat 与输入 image 的 shape 关系（HWC 布局）：
  *   (H,W)   -> (H+1,W+1)
  *   (H,W,C) -> (H+1,W+1,C)
- * 即最后两维各 +1（物理零填充边）。
+ * 即第 0/1 维（H、W）各 +1（物理零填充边），C 维不变。
  *
  * 约束（与 Tiling 一致）：
  *   - rank 必须为 2 或 3
@@ -57,8 +57,8 @@ static ge::graphStatus InferShapeIntegralImage(gert::InferShapeContext* context)
     outputShape->SetDimNum(dimNum);
     for (size_t i = 0; i < dimNum; i++) {
         int64_t dim = inputShape->GetDim(i);
-        // 最后两维是 H、W，各 +1；动态维度（-1）保持未知
-        if ((i == dimNum - 1 || i == dimNum - 2) && dim != ge::UNKNOWN_DIM) {
+        // 第 0/1 维是 H、W，各 +1（HWC：C 在最后一维，不变）；动态维度保持未知
+        if ((i == 0 || i == 1) && dim != ge::UNKNOWN_DIM) {
             dim += 1;
         }
         outputShape->SetDim(i, dim);

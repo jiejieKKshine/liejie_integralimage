@@ -81,6 +81,7 @@ private:
     int32_t evMte2V_ = 0;
     int32_t evMte2S_ = 0;
     int32_t evSMte2_ = 0;
+    int32_t evVMte3_ = 0;
     int32_t evVS_ = 0;
     int32_t evSV_ = 0;
     int32_t evSMte3_ = 0;
@@ -96,6 +97,10 @@ __aicore__ inline void IntegralImage<InT, AccT>::Init(GM_ADDR image, GM_ADDR sat
     channel_ = tilingData->channel;
     blockWidth_ = static_cast<int32_t>(tilingData->blockWidth);
     colStart_ = AscendC::GetBlockIdx() * blockWidth_;
+    // 保护：核数上限下的多余核直接退出（colStart 超出宽度时不处理）
+    if (colStart_ >= width_) {
+        return;
+    }
 
     const int32_t blockElems = blockWidth_ * static_cast<int32_t>(channel_);
 
@@ -105,8 +110,9 @@ __aicore__ inline void IntegralImage<InT, AccT>::Init(GM_ADDR image, GM_ADDR sat
     pipe_.InitBuffer(imgBuf_, blockElems * sizeof(InT));
     pipe_.InitBuffer(satBuf_, blockElems * sizeof(AccT));
     pipe_.InitBuffer(accBigBuf_, blockElems * sizeof(AccT));
-    pipe_.InitBuffer(prefixBuf_, static_cast<int32_t>(channel_) * sizeof(AccT));
-    pipe_.InitBuffer(zeroBigBuf_, 8 * static_cast<int32_t>(channel_) * sizeof(AccT));
+    // UB Buffer 长度统一向上对齐到 32 字节
+    pipe_.InitBuffer(prefixBuf_, (static_cast<int32_t>(channel_) * sizeof(AccT) + 31) & ~31);
+    pipe_.InitBuffer(zeroBigBuf_, (8 * static_cast<int32_t>(channel_) * sizeof(AccT) + 31) & ~31);
     pipe_.InitBuffer(castBuf_, blockWidth_ * sizeof(AccT));
     pipe_.InitBuffer(zeroBuf_, blockWidth_ * sizeof(AccT));
 
@@ -121,6 +127,7 @@ __aicore__ inline void IntegralImage<InT, AccT>::Init(GM_ADDR image, GM_ADDR sat
     evMte2V_ = GetTPipePtr()->FetchEventID(HardEvent::MTE2_V);
     evMte2S_ = GetTPipePtr()->FetchEventID(HardEvent::MTE2_S);
     evSMte2_ = GetTPipePtr()->FetchEventID(HardEvent::S_MTE2);
+    evVMte3_ = GetTPipePtr()->FetchEventID(HardEvent::V_MTE3);
     evVS_ = GetTPipePtr()->FetchEventID(HardEvent::V_S);
     evSV_ = GetTPipePtr()->FetchEventID(HardEvent::S_V);
     evSMte3_ = GetTPipePtr()->FetchEventID(HardEvent::S_MTE3);
@@ -204,6 +211,10 @@ __aicore__ inline void IntegralImage<InT, AccT>::ScatterChannel(LocalTensor<AccT
 template <typename InT, typename AccT>
 __aicore__ inline void IntegralImage<InT, AccT>::Process()
 {
+    // 多余核（colStart 超出宽度）不参与计算
+    if (colStart_ >= width_) {
+        return;
+    }
     const int32_t blockElems = blockWidth_ * static_cast<int32_t>(channel_);
     // 本核实际处理列数（最后一个核可能 < blockWidth，非对齐）
     const int32_t segW = (width_ - colStart_ < blockWidth_)
@@ -213,19 +224,21 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process()
 
     AscendC::Duplicate(zeroLocal_, static_cast<AccT>(0), blockWidth_);
     AscendC::Duplicate(accBigLocal_, static_cast<AccT>(0), blockElems);
+    // 零边界缓冲初始化（V 管线写，后续 MTE3 读）
+    AscendC::Duplicate(zeroBigLocal_, static_cast<AccT>(0), 8 * static_cast<int32_t>(channel_));
 
     // 第 0 行零填充：每核写自己列块 sat[0][colStart+1 .. colStart+segW]（偏移 +C）
     AscendC::Duplicate(satLocal_, static_cast<AccT>(0), blockElems);
-    AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
-    AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
+    AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+    AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
     StoreBlock(satGm_, satLocal_, (static_cast<int64_t>(colStart_) + 1) * channel_, segElems);
     AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
     AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-    // core 0 补 sat[0][0..7][*] = 0（8*C 元素，32B 对齐）
+    // core 0 补 sat[0][0..C-1] = 0（C 个元素，StoreBlock 处理非 32B）
     if (colStart_ == 0) {
-        AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
-        AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
-        AscendC::DataCopy(satGm_[0], zeroBigLocal_, 8 * static_cast<int32_t>(channel_));
+        AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+        AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+        StoreBlock(satGm_, zeroBigLocal_, 0, static_cast<int32_t>(channel_));
         AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
         AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
     }
@@ -235,18 +248,19 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process()
         AscendC::SetFlag<HardEvent::S_MTE2>(evSMte2_);
         AscendC::WaitFlag<HardEvent::S_MTE2>(evSMte2_);
 
-        // 1) 第 0 列零填充（core 0）：写 sat[r+1][0..7][*] = 0
+        // 1) 第 0 列零填充（core 0）：写 sat[r+1][0..C-1] = 0（C 个元素）
         if (colStart_ == 0) {
-            AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
-            AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
-            AscendC::DataCopy(satGm_[(r + 1) * (width_ + 1) * channel_], zeroBigLocal_,
-                              8 * static_cast<int32_t>(channel_));
+            AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+            AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+            StoreBlock(satGm_, zeroBigLocal_, (r + 1) * (width_ + 1) * channel_, static_cast<int32_t>(channel_));
             AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
             AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
         }
 
         // 2) 块起始补偿：左侧所有块（完整 blockW 宽）的列和，每通道独立
         AscendC::Duplicate(prefixLocal_, static_cast<AccT>(0), static_cast<int32_t>(channel_));
+        AscendC::SetFlag<HardEvent::V_S>(evVS_);
+        AscendC::WaitFlag<HardEvent::V_S>(evVS_);
         for (int64_t off = 0; off < colStart_; off += blockWidth_) {
             AscendC::SetFlag<HardEvent::S_MTE2>(evSMte2_);
             AscendC::WaitFlag<HardEvent::S_MTE2>(evSMte2_);

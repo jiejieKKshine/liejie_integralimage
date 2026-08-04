@@ -22,7 +22,7 @@ using namespace ge;
 static constexpr int64_t IDX_0 = 0;
 
 /*!
- * \brief 推断输出数据类型：整数输入（uint8/int16）-> int32，浮点输入（float16/float32）-> float32
+ * \brief 推断输出数据类型：整数输入（uint8）-> int32，浮点输入（float16/float32）-> float32
  */
 static ge::graphStatus InferDataTypeIntegralImage(gert::InferDataTypeContext* context)
 {
