@@ -15,11 +15,18 @@
  * 输出 sat 与输入 image 的 shape 关系：
  *   (H,W)   -> (H+1,W+1)
  *   (H,W,C) -> (H+1,W+1,C)
- * 即最后两维各 +1（物理零填充边），更高维不变。
+ * 即最后两维各 +1（物理零填充边）。
+ *
+ * 约束（与 Tiling 一致）：
+ *   - rank 必须为 2 或 3
+ *   - 动态 rank（-2）透传为 UnknownRank
+ *   - 动态维度（-1）：最后两维保持未知，不执行 +1
  */
 
 #include "register/op_impl_registry.h"
 #include "log/log.h"
+#include "util/shape_util.h"
+#include "infershape_utils.h"
 
 namespace ops {
 using namespace ge;
@@ -35,16 +42,23 @@ static ge::graphStatus InferShapeIntegralImage(gert::InferShapeContext* context)
     gert::Shape* outputShape = context->GetOutputShape(IDX_0);
     OP_CHECK_NULL_WITH_CONTEXT(context, outputShape);
 
+    // 动态 rank（-2）：输出透传 UnknownRank
+    if (Ops::Base::IsUnknownRank(*inputShape)) {
+        OP_LOGD(context->GetNodeName(), "input is UnknownRank, set output as UnknownRank.");
+        Ops::Base::SetUnknownRank(*outputShape);
+        return GRAPH_SUCCESS;
+    }
+
     auto dimNum = inputShape->GetDimNum();
-    if (dimNum < 2) {
-        OP_LOGE(context, "IntegralImage requires rank >= 2, got %zu", dimNum);
+    if (dimNum != 2 && dimNum != 3) {
+        OP_LOGE(context, "IntegralImage requires rank 2 or 3, got %zu", dimNum);
         return GRAPH_FAILED;
     }
     outputShape->SetDimNum(dimNum);
     for (size_t i = 0; i < dimNum; i++) {
         int64_t dim = inputShape->GetDim(i);
-        // 最后两维是 H、W，各 +1
-        if (i == dimNum - 1 || i == dimNum - 2) {
+        // 最后两维是 H、W，各 +1；动态维度（-1）保持未知
+        if ((i == dimNum - 1 || i == dimNum - 2) && dim != ge::UNKNOWN_DIM) {
             dim += 1;
         }
         outputShape->SetDim(i, dim);
