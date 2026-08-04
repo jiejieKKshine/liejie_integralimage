@@ -322,6 +322,70 @@ int RunAll(aclrtStream stream)
         ret = ret || RunCase3DT<float, float>(stream, C, H, W, in, ACL_FLOAT, ACL_FLOAT, exp);
     }
 
+    // 用例 6：uint8 1x1（W<32 全尾部，DataCopyPad 路径）
+    {
+        constexpr int64_t H = 1;
+        constexpr int64_t W = 1;
+        std::vector<uint8_t> in(H * W, 7);
+        std::vector<double> exp((H + 1) * (W + 1), 0);
+        for (int64_t i = 1; i <= H; i++) {
+            for (int64_t j = 1; j <= W; j++) {
+                exp[i * (W + 1) + j] = static_cast<double>(i) * j * 7;
+            }
+        }
+        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+    }
+
+    // 用例 7：uint8 1x64（单行）
+    {
+        constexpr int64_t H = 1;
+        constexpr int64_t W = 64;
+        std::vector<uint8_t> in(H * W, 3);
+        std::vector<double> exp((H + 1) * (W + 1), 0);
+        for (int64_t i = 1; i <= H; i++) {
+            for (int64_t j = 1; j <= W; j++) {
+                exp[i * (W + 1) + j] = static_cast<double>(i) * j * 3;
+            }
+        }
+        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+    }
+
+    // 用例 8：uint8 8x1（单列，W<32）
+    {
+        constexpr int64_t H = 8;
+        constexpr int64_t W = 1;
+        std::vector<uint8_t> in(H * W);
+        for (int64_t i = 0; i < H * W; i++) {
+            in[i] = static_cast<uint8_t>(i + 1);
+        }
+        std::vector<double> exp((H + 1) * (W + 1), 0);
+        for (int64_t i = 1; i <= H; i++) {
+            for (int64_t j = 1; j <= W; j++) {
+                exp[i * (W + 1) + j] = exp[(i - 1) * (W + 1) + j] + exp[i * (W + 1) + j - 1] -
+                                       exp[(i - 1) * (W + 1) + j - 1] + in[(i - 1) * W + (j - 1)];
+            }
+        }
+        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+    }
+
+    // 用例 9：uint8 257x513（大非对齐，单核全 DataCopyPad）
+    {
+        constexpr int64_t H = 257;
+        constexpr int64_t W = 513;
+        std::vector<uint8_t> in(H * W);
+        for (int64_t i = 0; i < H * W; i++) {
+            in[i] = static_cast<uint8_t>((i * 5 + 1) % 251);
+        }
+        std::vector<double> exp((H + 1) * (W + 1), 0);
+        for (int64_t i = 1; i <= H; i++) {
+            for (int64_t j = 1; j <= W; j++) {
+                exp[i * (W + 1) + j] = exp[(i - 1) * (W + 1) + j] + exp[i * (W + 1) + j - 1] -
+                                       exp[(i - 1) * (W + 1) + j - 1] + in[(i - 1) * W + (j - 1)];
+            }
+        }
+        ret = ret || RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+    }
+
     return ret;
 #endif
 }

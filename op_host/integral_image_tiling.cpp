@@ -66,11 +66,6 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
         OP_LOGE(context, "invalid shape H=%ld W=%ld C=%ld", height, width, channel);
         return ge::GRAPH_FAILED;
     }
-    if (width % MIN_BLOCK_WIDTH != 0) {
-        OP_LOGE(context, "IntegralImage v2 requires W %% 32 == 0, got W=%ld", width);
-        return ge::GRAPH_FAILED;
-    }
-
     auto inDtype = context->GetInputDesc(INDEXZERO)->GetDataType();
     // blockWidth 受 UB 约束：整块加载 blockW*C（InT + AccT 写回 + C*blockW 累加器）
     // 预算取 ubSize 的 70%，留余量给临时缓冲
@@ -79,18 +74,11 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
     int64_t ubBudget = static_cast<int64_t>(ubSize) * 7 / 10;
     int32_t blockWidth = MAX_BLOCK_WIDTH;
     while (blockWidth > MIN_BLOCK_WIDTH &&
-           (width % blockWidth != 0 ||
-            blockWidth * channel * (inBytes + 2 * accBytes) + 3 * blockWidth * accBytes > ubBudget)) {
+           blockWidth * channel * (inBytes + 2 * accBytes) + 3 * blockWidth * accBytes > ubBudget) {
         blockWidth >>= 1;
     }
-    // 最坏情况：单通道大图时 blockWidth 不受 C 限制，但需满足宽度整除
-    while (blockWidth > MIN_BLOCK_WIDTH && (width % blockWidth != 0)) {
-        blockWidth >>= 1;
-    }
-    int32_t coreNum = static_cast<int32_t>(width / blockWidth);
-    if (coreNum < 1) {
-        coreNum = 1;
-    }
+    // 核数向上取整：最后一个核处理非 32 对齐的尾部（W<32 时单核全尾部）
+    int32_t coreNum = static_cast<int32_t>((width + blockWidth - 1) / blockWidth);
 
     IntegralImageTilingData* tiling = context->GetTilingData<IntegralImageTilingData>();
     OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
