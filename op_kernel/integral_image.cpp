@@ -10,7 +10,7 @@
 
 /*!
  * \file integral_image.cpp
- * \brief IntegralImage kernel 入口
+ * \brief IntegralImage kernel entry
  */
 
 #include "integral_image.h"
@@ -25,15 +25,15 @@ __global__ __aicore__ void integral_image(
 
     if constexpr (schMode == INTEGRAL_IMAGE_TPL_SCH_MODE_U8_I32) {
         NsIntegralImage::IntegralImage<uint8_t, int32_t> op;
-        op.Init(image, sat, &tilingData);
+        op.Init(image, sat, workspace, &tilingData);
         op.Process();
     } else if constexpr (schMode == INTEGRAL_IMAGE_TPL_SCH_MODE_F16_F32) {
         NsIntegralImage::IntegralImage<half, float> op;
-        op.Init(image, sat, &tilingData);
+        op.Init(image, sat, workspace, &tilingData);
         op.Process();
     } else {
         NsIntegralImage::IntegralImage<float, float> op;
-        op.Init(image, sat, &tilingData);
+        op.Init(image, sat, workspace, &tilingData);
         op.Process();
     }
 }

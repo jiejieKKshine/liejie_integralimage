@@ -10,10 +10,11 @@
 
 /*!
  * \file integral_image_tiling.cpp
- * \brief IntegralImage host tiling：按列分块多核
+ * \brief IntegralImage host tiling: two-phase (per-row scan + per-column vertical add) or legacy column blocks
  */
 
 #include "log/log.h"
+#include <algorithm>
 #include "util/math_util.h"
 #include "op_host/tiling_util.h"
 #include "op_host/tiling_templates_registry.h"
@@ -26,6 +27,12 @@ constexpr uint32_t INDEXZERO = 0;
 constexpr uint32_t INDEXONE = 1;
 constexpr int32_t MAX_BLOCK_WIDTH = 1024;
 constexpr int32_t MIN_BLOCK_WIDTH = 32;
+constexpr int32_t TWO_PHASE_MIN_WIDTH = 128;
+constexpr int32_t COL_TILE_WIDTH = 256;
+// Platform (Ascend 910B, NPU_ARCH 2201) reserves the first 16MB of the caller workspace
+// for the runtime (kernel_utils_constants.h: RESERVED_WORKSPACE). The kernel's workspace
+// GM_ADDR points to base + 16MB, so the tiling must request reserved + user size.
+constexpr int64_t RESERVED_WORKSPACE_BYTES = 16LL * 1024 * 1024;
 
 struct IntegralImageCompileInfo {
 };
@@ -58,7 +65,7 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
         return ge::GRAPH_FAILED;
     }
 
-    // HWC 布局：rank2=(H,W)，rank3=(H,W,C)，C 在最后一维
+    // HWC layout: rank2 = (H, W), rank3 = (H, W, C), C is the last dim.
     int64_t height = inputShapeX.GetDim(INDEXZERO);
     int64_t width = inputShapeX.GetDim(INDEXONE);
     int64_t channel = (dimNum == 3) ? inputShapeX.GetDim(dimNum - 1) : 1;
@@ -67,25 +74,8 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
         return ge::GRAPH_FAILED;
     }
     auto inDtype = context->GetInputDesc(INDEXZERO)->GetDataType();
-    // blockWidth 受 UB 约束：整块加载 blockW*C（InT + AccT 写回 + C*blockW 累加器）
-    // 预算取 ubSize 的 70%，留余量给临时缓冲
-    int64_t inBytes = (inDtype == ge::DT_UINT8) ? 1 : ((inDtype == ge::DT_FLOAT16) ? 2 : 4);
     const int64_t accBytes = 4;
-    int64_t ubBudget = static_cast<int64_t>(ubSize) * 7 / 10;
-    int32_t blockWidth = MAX_BLOCK_WIDTH;
-    while (blockWidth > MIN_BLOCK_WIDTH &&
-           blockWidth * channel * (inBytes + 2 * accBytes) + 3 * blockWidth * accBytes > ubBudget) {
-        blockWidth >>= 1;
-    }
-    // 核数向上取整：最后一个核处理非 32 对齐的尾部（W<32 时单核全尾部）
-    int32_t coreNum = static_cast<int32_t>((width + blockWidth - 1) / blockWidth);
-    // 限制到平台实际 AI Core 数；当前 kernel 每核单块，
-    // 若块数超过平台核数（W > coreNum*blockW）则超当前支持范围，报错
-    if (coreNum > coreNumAiv) {
-        OP_LOGE(context, "IntegralImage: W=%ld requires %d blocks > platform cores %ld (per-core multi-block not implemented)",
-                width, coreNum, coreNumAiv);
-        return ge::GRAPH_FAILED;
-    }
+    int64_t inBytes = (inDtype == ge::DT_UINT8) ? 1 : ((inDtype == ge::DT_FLOAT16) ? 2 : 4);
 
     IntegralImageTilingData* tiling = context->GetTilingData<IntegralImageTilingData>();
     OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
@@ -94,12 +84,57 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
     tiling->height = height;
     tiling->width = width;
     tiling->channel = channel;
-    tiling->blockWidth = blockWidth;
-    tiling->coreNum = coreNum;
 
-    context->SetBlockDim(coreNum);
+    if (channel == 1 && width >= TWO_PHASE_MIN_WIDTH) {
+        // ---- two-phase path: phase A per-row horizontal scan, phase B per-column vertical add ----
+        int64_t rowTileWidth = MAX_BLOCK_WIDTH;
+        int64_t ubBudget = static_cast<int64_t>(ubSize) * 7 / 10;
+        while (rowTileWidth > MIN_BLOCK_WIDTH &&
+               rowTileWidth * inBytes + (rowTileWidth + 8) * accBytes +
+                   static_cast<int64_t>(COL_TILE_WIDTH + 8) * accBytes > ubBudget) {
+            rowTileWidth >>= 1;
+        }
+        int64_t colTileWidth = (width < COL_TILE_WIDTH) ? width : COL_TILE_WIDTH;
+        int64_t colTileCount = (width + colTileWidth - 1) / colTileWidth;
+        int64_t activeCoreNum = std::min(coreNumAiv, std::max(height, colTileCount));
+        if (activeCoreNum < 1) {
+            activeCoreNum = 1;
+        }
 
-    // 按输入 dtype 分派 tiling key（3 组合：uint8/float16/float32）
+        tiling->twoPhase = 1;
+        tiling->activeCoreNum = activeCoreNum;
+        tiling->rowTileWidth = rowTileWidth;
+        tiling->colTileWidth = colTileWidth;
+        tiling->colTileCount = colTileCount;
+        tiling->blockWidth = rowTileWidth; // reused by kernel UB buffer sizing
+        tiling->coreNum = activeCoreNum;
+
+        context->SetBlockDim(static_cast<uint32_t>(activeCoreNum));
+
+        size_t* ws = context->GetWorkspaceSizes(1);
+        OP_CHECK_NULL_WITH_CONTEXT(context, ws);
+        ws[0] = static_cast<size_t>(RESERVED_WORKSPACE_BYTES + height * width * accBytes);
+    } else {
+        // ---- legacy path: per-column block multi-core (2D small W or 3D HWC) ----
+        int64_t ubBudget = static_cast<int64_t>(ubSize) * 7 / 10;
+        int32_t blockWidth = MAX_BLOCK_WIDTH;
+        while (blockWidth > MIN_BLOCK_WIDTH &&
+               blockWidth * channel * (inBytes + 2 * accBytes) + 3 * blockWidth * accBytes > ubBudget) {
+            blockWidth >>= 1;
+        }
+        int32_t coreNum = static_cast<int32_t>((width + blockWidth - 1) / blockWidth);
+        if (coreNum > coreNumAiv) {
+            OP_LOGE(context,
+                    "IntegralImage: W=%ld requires %d blocks > platform cores %ld (per-core multi-block not implemented)",
+                    width, coreNum, coreNumAiv);
+            return ge::GRAPH_FAILED;
+        }
+
+        tiling->blockWidth = blockWidth;
+        tiling->coreNum = coreNum;
+        context->SetBlockDim(static_cast<uint32_t>(coreNum));
+    }
+
     uint64_t tilingKey = 0;
     if (inDtype == ge::DT_UINT8) {
         tilingKey = GET_TPL_TILING_KEY(INTEGRAL_IMAGE_TPL_SCH_MODE_U8_I32);

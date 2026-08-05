@@ -17,11 +17,17 @@
 #define _INTEGRAL_IMAGE_TILING_DATA_H_
 
 struct IntegralImageTilingData {
-    int64_t height = 0;      // 输入 H
-    int64_t width = 0;       // 输入 W
-    int64_t channel = 1;     // 输入 C（3D），2D 时为 1
-    int64_t blockWidth = 0;  // 每核处理的列宽（32 对齐）
-    int64_t coreNum = 1;     // 使用的 AI Core 数
+    int64_t height = 0;      // input H
+    int64_t width = 0;       // input W
+    int64_t channel = 1;     // input C (3D only), 1 for 2D
+    int64_t blockWidth = 0;  // column block width for legacy path (32 aligned)
+    int64_t coreNum = 1;     // block dim (number of AI cores launched)
+    // ---- two-phase: per-row horizontal scan + workspace + per-column vertical add ----
+    int64_t twoPhase = 0;        // 1 = enable two-phase (2D and W >= 128)
+    int64_t activeCoreNum = 1;   // cores used by two-phase: min(platform AIV, max(H, colTileCount))
+    int64_t rowTileWidth = 0;    // phase A in-row tile width (UB bound, <= 1024)
+    int64_t colTileWidth = 0;    // phase B column tile width (vector width)
+    int64_t colTileCount = 0;    // phase B column tile count = ceil(W / colTileWidth)
 };
 
 #endif // _INTEGRAL_IMAGE_TILING_DATA_H_
