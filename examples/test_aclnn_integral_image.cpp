@@ -143,14 +143,25 @@ int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& i
 
     bool ok = true;
     for (int64_t i = 0; i < OH * OW; i++) {
-        double got = static_cast<double>(actual[i]);
-        double want = expected[i];
-        double tol = (std::fabs(want) > 1.0) ? std::fabs(want) * 1e-4 : 1e-3;
-        if (std::fabs(got - want) > tol) {
-            ok = false;
-            std::cout << "sat mismatch at " << i / OW << "," << i % OW << ": got " << got << " expected " << want
-                      << std::endl;
-            break;
+        if constexpr (std::is_same<OutT, int32_t>::value) {
+            // integer outputs: exact comparison (dtype wrap-around included)
+            int64_t want = static_cast<int64_t>(static_cast<int32_t>(expected[i]));
+            if (static_cast<int64_t>(actual[i]) != want) {
+                ok = false;
+                std::cout << "sat mismatch at " << i / OW << "," << i % OW << ": got " << static_cast<int64_t>(actual[i])
+                          << " expected " << want << std::endl;
+                break;
+            }
+        } else {
+            double got = static_cast<double>(actual[i]);
+            double want = expected[i];
+            double tol = (std::fabs(want) > 1.0) ? std::fabs(want) * 1e-4 : 1e-3;
+            if (std::fabs(got - want) > tol) {
+                ok = false;
+                std::cout << "sat mismatch at " << i / OW << "," << i % OW << ": got " << got << " expected " << want
+                          << std::endl;
+                break;
+            }
         }
     }
 
@@ -649,6 +660,128 @@ int RunCase16Only(aclrtStream stream)
     return RunCaseT<float, float>(stream, H, W, in, ACL_FLOAT, ACL_FLOAT, exp);
 }
 
+// Strict large-shape verification: runs the operator and compares with an int64 CPU reference.
+// int32 outputs are compared exactly (wrap-around semantics included); float outputs use a tight
+// relative tolerance. This closes the gap that the functional suite only checked shapes <= 512.
+template <typename InT, typename OutT>
+int VerifyShapeT(aclrtStream stream, int64_t H, int64_t W, aclDataType inAclType, aclDataType outAclType,
+                 bool isFloat)
+{
+    const int64_t OH = H + 1;
+    const int64_t OW = W + 1;
+    std::vector<InT> input(H * W);
+    unsigned int seed = 12345u;
+    for (auto& v : input) {
+        seed = seed * 1103515245u + 12345u;
+        v = static_cast<InT>((seed >> 16) & 0xFF);
+    }
+    // CPU reference: int64 horizontal prefix then int64 vertical accumulation.
+    std::vector<int64_t> refSat(OH * OW, 0);
+    std::vector<int64_t> rowPrefix(W, 0);
+    for (int64_t r = 0; r < H; r++) {
+        int64_t run = 0;
+        for (int64_t c = 0; c < W; c++) {
+            run += static_cast<int64_t>(input[r * W + c]);
+            rowPrefix[c] = run;
+        }
+        for (int64_t c = 0; c < W; c++) {
+            refSat[(r + 1) * OW + (c + 1)] = refSat[r * OW + (c + 1)] + rowPrefix[c];
+        }
+    }
+
+    aclTensor* imageTensor = nullptr;
+    aclTensor* satTensor = nullptr;
+    void* imageDev = nullptr;
+    void* satDev = nullptr;
+    std::vector<int64_t> inShape = {H, W};
+    std::vector<int64_t> outShape = {OH, OW};
+
+    int ret = CreateAclTensor(input, inShape, &imageDev, inAclType, &imageTensor);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: create image tensor failed" << std::endl; return ret);
+    ret = CreateAclTensor(std::vector<OutT>(), outShape, &satDev, outAclType, &satTensor);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: create sat tensor failed" << std::endl; return ret);
+
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, satTensor, &workspaceSize, &executor);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: GetWorkspaceSize failed: " << ret << std::endl; return ret);
+    void* workspaceAddr = nullptr;
+    if (workspaceSize > 0) {
+        ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: workspace malloc failed" << std::endl; return ret);
+    }
+    ret = aclnnIntegralImage(workspaceAddr, workspaceSize, executor, stream);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: aclnnIntegralImage failed: " << ret << std::endl; return ret);
+    ret = aclrtSynchronizeStream(stream);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: sync failed: " << ret << std::endl; return ret);
+
+    std::vector<OutT> actual(OH * OW, 0);
+    ret = aclrtMemcpy(actual.data(), actual.size() * sizeof(OutT), satDev, actual.size() * sizeof(OutT),
+                      ACL_MEMCPY_DEVICE_TO_HOST);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: copy back failed" << std::endl; return ret);
+
+    int64_t badCount = 0;
+    int64_t firstBadR = -1;
+    int64_t firstBadC = -1;
+    double gotV = 0.0;
+    double wantV = 0.0;
+    for (int64_t i = 0; i < OH * OW; i++) {
+        double got = static_cast<double>(actual[i]);
+        double want = static_cast<double>(refSat[i]);
+        if (isFloat) {
+            if (std::fabs(got - want) > 1e-3 * std::max(1.0, std::fabs(want))) {
+                if (badCount == 0) {
+                    firstBadR = i / OW;
+                    firstBadC = i % OW;
+                    gotV = got;
+                    wantV = want;
+                }
+                badCount++;
+            }
+        } else {
+            // exact int32 comparison (wrap-around is part of the dtype semantics)
+            int64_t wrapped = static_cast<int64_t>(static_cast<int32_t>(refSat[i]));
+            if (static_cast<int64_t>(actual[i]) != wrapped) {
+                if (badCount == 0) {
+                    firstBadR = i / OW;
+                    firstBadC = i % OW;
+                    gotV = static_cast<double>(actual[i]);
+                    wantV = static_cast<double>(wrapped);
+                }
+                badCount++;
+            }
+        }
+    }
+    if (workspaceSize > 0) {
+        aclrtFree(workspaceAddr);
+    }
+    aclDestroyTensor(imageTensor);
+    aclDestroyTensor(satTensor);
+    aclrtFree(imageDev);
+    aclrtFree(satDev);
+
+    std::cout << (badCount == 0 ? "[VERIFY-PASS]" : "[VERIFY-FAIL]") << " " << typeid(InT).name() << " H=" << H
+              << " W=" << W << " bad=" << badCount;
+    if (badCount > 0) {
+        std::cout << " first=" << firstBadR << "," << firstBadC << " got=" << gotV << " want=" << wantV;
+    }
+    std::cout << std::endl;
+    return badCount == 0 ? 0 : 1;
+}
+
+int RunVerify(aclrtStream stream)
+{
+    int ret = 0;
+    int64_t sizes[][2] = {{1024, 1024}, {2048, 2048}, {4096, 4096}};
+    for (auto& s : sizes) {
+        ret |= VerifyShapeT<uint8_t, int32_t>(stream, s[0], s[1], ACL_UINT8, ACL_INT32, false);
+    }
+    for (auto& s : sizes) {
+        ret |= VerifyShapeT<float, float>(stream, s[0], s[1], ACL_FLOAT, ACL_FLOAT, true);
+    }
+    return ret;
+}
+
 int main(int argc, char* argv[])
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -667,6 +800,8 @@ int main(int argc, char* argv[])
         ret = RunBench(stream, iters);
     } else if ((argc >= 2) && (std::string(argv[1]) == "case16")) {
         ret = RunCase16Only(stream);
+    } else if ((argc >= 2) && (std::string(argv[1]) == "verify")) {
+        ret = RunVerify(stream);
     } else {
         ret = RunAll(stream);
     }
