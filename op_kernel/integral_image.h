@@ -29,11 +29,19 @@
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
+#include "adv_api/math/cumsum.h"
 #include "integral_image_tiling_data.h"
 
 namespace NsIntegralImage {
 
 using namespace AscendC;
+
+// fp32/fp16 phase-A row scan: vector CumSum along the last axis, no last-row output
+// (carry is read back from the destination tail instead).
+constexpr AscendC::CumSumConfig kIntegralImageCumSumCfg = {
+    true, false, false, AscendC::CumSumAlgorithm::CUMSUM_ALGORITHM_LINEBYLINE};
+// Phase B processes this many rows per batch (2D copy + in-order V-pipe adds).
+constexpr int32_t kPhaseBBatchRows = 8;
 
 template <typename InT, typename AccT>
 class IntegralImage {
@@ -48,8 +56,15 @@ private:
                                      int32_t elems);
     __aicore__ inline void LoadBlockAcc(LocalTensor<AccT>& dst, const GlobalTensor<AccT>& src, int64_t offset,
                                         int32_t elems);
+    __aicore__ inline void LoadBlockAcc2D(LocalTensor<AccT>& dst, const GlobalTensor<AccT>& src, int64_t offset,
+                                          int32_t rows, int32_t rowLen, int64_t srcPitch);
+    __aicore__ inline void LoadBlock2D(LocalTensor<InT>& dst, const GlobalTensor<InT>& src, int64_t offset,
+                                       int32_t rows, int32_t rowLen, int64_t srcPitch, int64_t dstRowGap);
     __aicore__ inline void StoreBlock(const GlobalTensor<AccT>& dst, const LocalTensor<AccT>& src, int64_t offset,
                                       int32_t elems);
+    __aicore__ inline void StoreBlockAcc2D(const GlobalTensor<AccT>& dst, const LocalTensor<AccT>& src,
+                                           int64_t offset, int32_t rows, int32_t rowLen, int64_t dstPitch,
+                                           int64_t srcRowGap);
     __aicore__ inline void RowScan(LocalTensor<AccT>& row, int32_t len, AccT init = static_cast<AccT>(0));
     __aicore__ inline void ExtractChannel(LocalTensor<AccT>& dst, const LocalTensor<InT>& src, int32_t c,
                                           int32_t channel, int32_t len);
@@ -75,6 +90,12 @@ private:
     TBuf<TPosition::VECIN> leftBuf_;  // left block row-sum buffer (block width + zero gutter)
     TBuf<TPosition::VECIN> halfBuf_;  // u8->f16 intermediate buffer (block width + 8 halves)
     TBuf<TPosition::VECIN> wsRowBuf_; // phase B workspace row tile
+    TBuf<TPosition::VECIN> lastRowBuf_; // CumSum last-row scratch (row tile width)
+    TBuf<TPosition::VECIN> wsBatchBuf_; // phase B batched workspace rows
+    TBuf<TPosition::VECIN> outBuf_;     // phase B batched output snapshot
+    TBuf<TPosition::VECIN> imgBatchBuf_;  // phase A batched input rows (InT)
+    TBuf<TPosition::VECIN> castBatchBuf_; // phase A batched fp16->fp32 cast
+    TBuf<TPosition::VECIN> dstBatchBuf_;  // phase A batched CumSum output
     LocalTensor<InT> imgLocal_;
     LocalTensor<AccT> satLocal_;
     LocalTensor<AccT> accBigLocal_;
@@ -85,6 +106,12 @@ private:
     LocalTensor<AccT> leftLocal_;
     LocalTensor<half> halfLocal_;
     LocalTensor<AccT> wsRowLocal_;
+    LocalTensor<AccT> lastRowLocal_;
+    LocalTensor<AccT> wsBatchLocal_;
+    LocalTensor<AccT> outLocal_;
+    LocalTensor<InT> imgBatchLocal_;
+    LocalTensor<AccT> castBatchLocal_;
+    LocalTensor<AccT> dstBatchLocal_;
 
     GlobalTensor<InT> imageGm_;
     GlobalTensor<AccT> satGm_;
@@ -143,6 +170,18 @@ __aicore__ inline void IntegralImage<InT, AccT>::Init(GM_ADDR image, GM_ADDR sat
     pipe_.InitBuffer(leftBuf_, (blockWidth_ + 8) * sizeof(AccT));
     pipe_.InitBuffer(halfBuf_, (blockWidth_ + 8) * sizeof(half));
     pipe_.InitBuffer(wsRowBuf_, (static_cast<int32_t>(colTileWidth_) + 8) * sizeof(AccT));
+    pipe_.InitBuffer(lastRowBuf_, (blockWidth_ + 8) * sizeof(AccT));
+    pipe_.InitBuffer(wsBatchBuf_, kPhaseBBatchRows * (static_cast<int32_t>(colTileWidth_) + 8) * sizeof(AccT));
+    pipe_.InitBuffer(outBuf_, kPhaseBBatchRows * (static_cast<int32_t>(colTileWidth_) + 8) * sizeof(AccT));
+    if constexpr (!std::is_same<InT, uint8_t>::value) {
+        // phase-A batch buffers are only needed by the fp32/fp16 CumSum path;
+        // keep VECIN small so PopStackBuffer(LCM) still has room for CumSum tmp.
+        pipe_.InitBuffer(imgBatchBuf_, kPhaseBBatchRows * (blockWidth_ + 8) * sizeof(InT));
+        if constexpr (!std::is_same<InT, AccT>::value) {
+            pipe_.InitBuffer(castBatchBuf_, kPhaseBBatchRows * (blockWidth_ + 8) * sizeof(AccT));
+        }
+        pipe_.InitBuffer(dstBatchBuf_, kPhaseBBatchRows * (blockWidth_ + 8) * sizeof(AccT));
+    }
     if (twoPhase_ == 1 && workspace != nullptr) {
         // ops-cv custom op convention: the workspace GM_ADDR is the raw user workspace base.
         wsGm_.SetGlobalBuffer((__gm__ AccT*)workspace);
@@ -159,6 +198,16 @@ __aicore__ inline void IntegralImage<InT, AccT>::Init(GM_ADDR image, GM_ADDR sat
     leftLocal_ = leftBuf_.template Get<AccT>();
     halfLocal_ = halfBuf_.template Get<half>();
     wsRowLocal_ = wsRowBuf_.template Get<AccT>();
+    lastRowLocal_ = lastRowBuf_.template Get<AccT>();
+    wsBatchLocal_ = wsBatchBuf_.template Get<AccT>();
+    outLocal_ = outBuf_.template Get<AccT>();
+    if constexpr (!std::is_same<InT, uint8_t>::value) {
+        imgBatchLocal_ = imgBatchBuf_.template Get<InT>();
+        if constexpr (!std::is_same<InT, AccT>::value) {
+            castBatchLocal_ = castBatchBuf_.template Get<AccT>();
+        }
+        dstBatchLocal_ = dstBatchBuf_.template Get<AccT>();
+    }
 
     evMte2V_ = GetTPipePtr()->FetchEventID(HardEvent::MTE2_V);
     evVMte2_ = GetTPipePtr()->FetchEventID(HardEvent::V_MTE2);
@@ -223,6 +272,51 @@ __aicore__ inline void IntegralImage<InT, AccT>::LoadBlockAcc(LocalTensor<AccT>&
         p.rsv = 0;
         AscendC::DataCopyPad(dst, src[offset], p, {true, 0, 0, static_cast<AccT>(0)});
     }
+}
+
+// Batched 2D workspace load (DataCopyPad, byte-unit strides): rows x rowLen AccT elements,
+// consecutive rows are srcPitch elements apart in GM, zero-padded tail.
+template <typename InT, typename AccT>
+__aicore__ inline void IntegralImage<InT, AccT>::LoadBlockAcc2D(LocalTensor<AccT>& dst, const GlobalTensor<AccT>& src,
+    int64_t offset, int32_t rows, int32_t rowLen, int64_t srcPitch)
+{
+    DataCopyExtParams p;
+    p.blockCount = rows;
+    p.blockLen = rowLen * sizeof(AccT);
+    p.srcStride = static_cast<uint32_t>((srcPitch - rowLen) * sizeof(AccT));
+    p.dstStride = 0;
+    p.rsv = 0;
+    AscendC::DataCopyPad(dst, src[offset], p, {true, 0, 0, static_cast<AccT>(0)});
+}
+
+// Batched 2D input load (InT): rows x rowLen, GM rows srcPitch apart, UB rows dstRowGap apart
+// (dstRowGap = per-row UB stride - rowLen, zero-padded tail).
+template <typename InT, typename AccT>
+__aicore__ inline void IntegralImage<InT, AccT>::LoadBlock2D(LocalTensor<InT>& dst, const GlobalTensor<InT>& src,
+    int64_t offset, int32_t rows, int32_t rowLen, int64_t srcPitch, int64_t dstRowGap)
+{
+    DataCopyExtParams p;
+    p.blockCount = rows;
+    p.blockLen = rowLen * sizeof(InT);
+    p.srcStride = static_cast<uint32_t>((srcPitch - rowLen) * sizeof(InT));
+    p.dstStride = static_cast<uint32_t>(dstRowGap * sizeof(InT));
+    p.rsv = 0;
+    AscendC::DataCopyPad(dst, src[offset], p, {true, 0, 0, static_cast<InT>(0)});
+}
+
+// Batched 2D store (DataCopyPad, byte-unit strides): rows x rowLen AccT elements from a
+// UB snapshot (rows srcRowGap apart) to GM rows dstPitch elements apart.
+template <typename InT, typename AccT>
+__aicore__ inline void IntegralImage<InT, AccT>::StoreBlockAcc2D(const GlobalTensor<AccT>& dst,
+    const LocalTensor<AccT>& src, int64_t offset, int32_t rows, int32_t rowLen, int64_t dstPitch, int64_t srcRowGap)
+{
+    DataCopyExtParams p;
+    p.blockCount = rows;
+    p.blockLen = rowLen * sizeof(AccT);
+    p.srcStride = static_cast<uint32_t>(srcRowGap * sizeof(AccT));
+    p.dstStride = static_cast<uint32_t>((dstPitch - rowLen) * sizeof(AccT));
+    p.rsv = 0;
+    AscendC::DataCopyPad(dst[offset], src, p);
 }
 
 template <typename InT, typename AccT>
@@ -308,38 +402,87 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
     const int64_t colTileW = colTileWidth_;
     const int64_t activeCore = activeCoreNum_;
 
-    // ---------- Phase A: per-row horizontal scan (each row handled by one core) ----------
-    for (int64_t row = blockIdx; row < height_; row += activeCore) {
-        AccT carry = static_cast<AccT>(0);
-        for (int64_t col = 0; col < width_; col += rowTileW) {
-            const int32_t tileW = static_cast<int32_t>((rowTileW < width_ - col) ? rowTileW : (width_ - col));
-            AscendC::SetFlag<HardEvent::V_MTE2>(evVMte2_);
-            AscendC::WaitFlag<HardEvent::V_MTE2>(evVMte2_);
-            LoadBlock(imgLocal_, imageGm_, row * width_ + col, tileW);
-            // scalar cast / row scan will read imgLocal_
-            AscendC::SetFlag<HardEvent::MTE2_S>(evMte2S_);
-            AscendC::WaitFlag<HardEvent::MTE2_S>(evMte2S_);
+    // ---------- Phase A: horizontal scan ----------
+    if constexpr (std::is_same<InT, uint8_t>::value) {
+        // u8: strided per-row scalar scan (kept until an int32 vector scan lands)
+        for (int64_t row = blockIdx; row < height_; row += activeCore) {
+            AccT carry = static_cast<AccT>(0);
+            for (int64_t col = 0; col < width_; col += rowTileW) {
+                const int32_t tileW = static_cast<int32_t>((rowTileW < width_ - col) ? rowTileW : (width_ - col));
+                AscendC::SetFlag<HardEvent::V_MTE2>(evVMte2_);
+                AscendC::WaitFlag<HardEvent::V_MTE2>(evVMte2_);
+                LoadBlock(imgLocal_, imageGm_, row * width_ + col, tileW);
+                AscendC::SetFlag<HardEvent::MTE2_S>(evMte2S_);
+                AscendC::WaitFlag<HardEvent::MTE2_S>(evMte2S_);
 
-            LocalTensor<AccT> work = castLocal_;
-            if constexpr (std::is_same<InT, AccT>::value) {
-                work = imgLocal_;
+                LocalTensor<AccT> work = castLocal_;
+                CastVec2D(work, imgLocal_, tileW);
+                RowScan(work, tileW, carry);
+                carry = work.GetValue(tileW - 1);
+
+                // store this tile into the workspace (last write is scalar -> S->MTE3 sync)
+                AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
+                AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
+                StoreBlock(wsGm_, work, row * width_ + col, tileW);
+                AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+                AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
             }
-            CastVec2D(work, imgLocal_, tileW);
-            if constexpr (!std::is_same<InT, AccT>::value && !std::is_same<InT, uint8_t>::value) {
-                // fp16: vector cast then scalar RowScan needs V->S sync
+        }
+    } else {
+        // fp32/fp16: contiguous row bands, 8-row batches, vector CumSum per column tile
+        const int64_t rowsPerCore = (height_ + activeCore - 1) / activeCore;
+        const int64_t rowStart = blockIdx * rowsPerCore;
+        const int64_t rowEnd = (height_ < rowStart + rowsPerCore) ? height_ : (rowStart + rowsPerCore);
+        for (int64_t rb = rowStart; rb < rowEnd; rb += kPhaseBBatchRows) {
+            const int32_t rows = static_cast<int32_t>(
+                ((rowEnd - rb) < kPhaseBBatchRows) ? (rowEnd - rb) : kPhaseBBatchRows);
+            AccT carryVals[kPhaseBBatchRows];
+            for (int32_t k = 0; k < rows; k++) {
+                carryVals[k] = static_cast<AccT>(0);
+            }
+            for (int64_t col = 0; col < width_; col += rowTileW) {
+                const int32_t tileW = static_cast<int32_t>((rowTileW < width_ - col) ? rowTileW : (width_ - col));
+                const int32_t innerAligned = ((tileW + 7) / 8) * 8; // 32B aligned for AccT=float
+                AscendC::SetFlag<HardEvent::V_MTE2>(evVMte2_);
+                AscendC::WaitFlag<HardEvent::V_MTE2>(evVMte2_);
+                LoadBlock2D(imgBatchLocal_, imageGm_, rb * width_ + col, rows, tileW, width_,
+                            innerAligned - tileW);
+                AscendC::SetFlag<HardEvent::MTE2_V>(evMte2V_);
+                AscendC::WaitFlag<HardEvent::MTE2_V>(evMte2V_);
+
+                LocalTensor<AccT> srcBatch = castBatchLocal_;
+                if constexpr (std::is_same<InT, AccT>::value) {
+                    srcBatch = imgBatchLocal_;
+                } else {
+                    // fp16 -> fp32 vector cast, one row per call (aligned count)
+                    for (int32_t k = 0; k < rows; k++) {
+                        AscendC::Cast<AccT, InT>(castBatchLocal_[k * innerAligned], imgBatchLocal_[k * innerAligned],
+                                                 RoundMode::CAST_NONE, static_cast<uint32_t>(innerAligned));
+                    }
+                }
+                AscendC::CumSum<AccT, kIntegralImageCumSumCfg>(dstBatchLocal_, lastRowLocal_, srcBatch,
+                    AscendC::CumSumInfo{static_cast<uint32_t>(rows), static_cast<uint32_t>(innerAligned)});
+                if (col > 0) {
+                    // propagate each row's carry from the previous column tile
+                    for (int32_t k = 0; k < rows; k++) {
+                        AscendC::Adds(dstBatchLocal_[k * innerAligned], dstBatchLocal_[k * innerAligned],
+                                      carryVals[k], tileW);
+                    }
+                }
+                // scalar read of each row's tail needs V->S sync
                 AscendC::SetFlag<HardEvent::V_S>(evVS_);
                 AscendC::WaitFlag<HardEvent::V_S>(evVS_);
+                for (int32_t k = 0; k < rows; k++) {
+                    carryVals[k] = dstBatchLocal_.GetValue(k * innerAligned + tileW - 1);
+                }
+                // store this batch into the workspace (last write is vector -> V->MTE3 sync)
+                AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+                AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+                StoreBlockAcc2D(wsGm_, dstBatchLocal_, rb * width_ + col, rows, tileW, width_,
+                                innerAligned - tileW);
+                AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+                AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
             }
-            // scalar row scan with the carry from the previous tile of this row
-            RowScan(work, tileW, carry);
-            carry = work.GetValue(tileW - 1);
-
-            // store this tile into the workspace (last write is scalar -> S->MTE3 sync)
-            AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
-            AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
-            StoreBlock(wsGm_, work, row * width_ + col, tileW);
-            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
         }
     }
 
@@ -363,32 +506,46 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
         AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
         AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
 
-        if (tile == 0) {
-            // tile 0: zero left column sat[r+1][0] and vertical accumulate in aligned buffers.
-            // (avoid unaligned UB vector ops: keep accumulator in accBigLocal_, store zero column separately)
-            // zeroBigLocal_ is sized 8*C AccT (32B); only the first element is stored per row.
+        AscendC::Duplicate(accBigLocal_, static_cast<AccT>(0), static_cast<int32_t>(colTileW));
+        if (tileW % 8 == 0) {
+            // ---- batched path: 8 rows per iteration, sync overhead divided by 8 ----
             AscendC::Duplicate(zeroBigLocal_, static_cast<AccT>(0), 8);
-            AscendC::Duplicate(accBigLocal_, static_cast<AccT>(0), static_cast<int32_t>(colTileW));
-            for (int64_t r = 0; r < height_; r++) {
+            for (int64_t rb = 0; rb < height_; rb += kPhaseBBatchRows) {
+                const int32_t rows = static_cast<int32_t>(
+                    ((height_ - rb) < kPhaseBBatchRows) ? (height_ - rb) : kPhaseBBatchRows);
                 AscendC::SetFlag<HardEvent::V_MTE2>(evVMte2_);
                 AscendC::WaitFlag<HardEvent::V_MTE2>(evVMte2_);
-                LoadBlockAcc(wsRowLocal_, wsGm_, r * width_, tileW);
+                LoadBlockAcc2D(wsBatchLocal_, wsGm_, rb * width_ + colStart, rows, tileW, width_);
                 AscendC::SetFlag<HardEvent::MTE2_V>(evMte2V_);
                 AscendC::WaitFlag<HardEvent::MTE2_V>(evMte2V_);
-                AscendC::Add(accBigLocal_, accBigLocal_, wsRowLocal_, tileW);
-                AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-                AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-                // left column zero
-                StoreBlock(satGm_, zeroBigLocal_, (r + 1) * (width_ + 1), 1);
-                AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-                AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-                // main row segment sat[r+1][1 .. tileW]
-                StoreBlock(satGm_, accBigLocal_, (r + 1) * (width_ + 1) + 1, tileW);
+                if (tile == 0) {
+                    for (int32_t k = 0; k < rows; k++) {
+                        AscendC::Add(accBigLocal_, accBigLocal_, wsBatchLocal_[k * tileW], tileW);
+                        AscendC::Adds(outLocal_[k * tileW], accBigLocal_, static_cast<AccT>(0), tileW);
+                    }
+                    AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+                    AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+                    // left column zeros (per-row small stores) + main row segments (batched)
+                    for (int32_t k = 0; k < rows; k++) {
+                        StoreBlock(satGm_, zeroBigLocal_, (rb + k + 1) * (width_ + 1), 1);
+                    }
+                    StoreBlockAcc2D(satGm_, outLocal_, (rb + 1) * (width_ + 1) + 1, rows, tileW, width_ + 1, 0);
+                } else {
+                    for (int32_t k = 0; k < rows; k++) {
+                        AscendC::Add(accBigLocal_, accBigLocal_, wsBatchLocal_[k * tileW], tileW);
+                        AscendC::Adds(outLocal_[k * tileW], accBigLocal_, static_cast<AccT>(0), tileW);
+                    }
+                    AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+                    AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+                    StoreBlockAcc2D(satGm_, outLocal_, (rb + 1) * (width_ + 1) + colStart + 1, rows, tileW,
+                                    width_ + 1, 0);
+                }
                 AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
                 AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
             }
         } else {
-            AscendC::Duplicate(accBigLocal_, static_cast<AccT>(0), static_cast<int32_t>(colTileW));
+            // ---- unaligned tail tile: per-row fallback ----
+            AscendC::Duplicate(zeroBigLocal_, static_cast<AccT>(0), 8);
             for (int64_t r = 0; r < height_; r++) {
                 AscendC::SetFlag<HardEvent::V_MTE2>(evVMte2_);
                 AscendC::WaitFlag<HardEvent::V_MTE2>(evVMte2_);
@@ -398,7 +555,15 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
                 AscendC::Add(accBigLocal_, accBigLocal_, wsRowLocal_, tileW);
                 AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
                 AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-                StoreBlock(satGm_, accBigLocal_, (r + 1) * (width_ + 1) + colStart + 1, tileW);
+                if (tile == 0) {
+                    // left column zero + main segment
+                    StoreBlock(satGm_, zeroBigLocal_, (r + 1) * (width_ + 1), 1);
+                    AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+                    AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+                    StoreBlock(satGm_, accBigLocal_, (r + 1) * (width_ + 1) + 1, tileW);
+                } else {
+                    StoreBlock(satGm_, accBigLocal_, (r + 1) * (width_ + 1) + colStart + 1, tileW);
+                }
                 AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
                 AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
             }

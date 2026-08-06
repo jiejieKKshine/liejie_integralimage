@@ -28,7 +28,8 @@ constexpr uint32_t INDEXONE = 1;
 constexpr int32_t MAX_BLOCK_WIDTH = 1024;
 constexpr int32_t MIN_BLOCK_WIDTH = 32;
 constexpr int32_t TWO_PHASE_MIN_WIDTH = 128;
-constexpr int32_t COL_TILE_WIDTH = 256;
+constexpr int32_t MAX_COL_TILE_WIDTH = 256;
+constexpr int32_t MIN_COL_TILE_WIDTH = 32;
 // Platform (Ascend 910B, NPU_ARCH 2201) reserves the first 16MB of the caller workspace
 // for the runtime (kernel_utils_constants.h: RESERVED_WORKSPACE). The kernel's workspace
 // GM_ADDR points to base + 16MB, so the tiling must request reserved + user size.
@@ -87,14 +88,38 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
 
     if (channel == 1 && width >= TWO_PHASE_MIN_WIDTH) {
         // ---- two-phase path: phase A per-row horizontal scan, phase B per-column vertical add ----
+        // UB budget must also reserve the phase-A batch buffers and the CumSum LCM tmp
+        // (TPipe allocates all UB positions from one pool; PopStackBuffer(LCM) takes the tail).
+        const int64_t kFixedUb = 56 * 1024;
+        const bool fpPath = (inDtype == ge::DT_FLOAT16 || inDtype == ge::DT_FLOAT);
         int64_t rowTileWidth = MAX_BLOCK_WIDTH;
-        int64_t ubBudget = static_cast<int64_t>(ubSize) * 7 / 10;
-        while (rowTileWidth > MIN_BLOCK_WIDTH &&
-               rowTileWidth * inBytes + (rowTileWidth + 8) * accBytes +
-                   static_cast<int64_t>(COL_TILE_WIDTH + 8) * accBytes > ubBudget) {
+        int64_t ubBudget = static_cast<int64_t>(ubSize) * 9 / 10;
+        while (rowTileWidth > MIN_BLOCK_WIDTH) {
+            int64_t batchBytes = 0;
+            if (fpPath) {
+                int64_t extraCast = (inDtype == ge::DT_FLOAT16) ? accBytes : 0;
+                batchBytes = 8LL * (rowTileWidth + 8) * (inBytes + accBytes + extraCast) +
+                             8LL * rowTileWidth * accBytes * 2; // CumSum LCM tmp
+            }
+            if (kFixedUb + batchBytes <= ubBudget) {
+                break;
+            }
             rowTileWidth >>= 1;
         }
-        int64_t colTileWidth = (width < COL_TILE_WIDTH) ? width : COL_TILE_WIDTH;
+        // Phase B: one column tile per core for wide images. colTileWidth is chosen so that
+        // colTileCount is close to (but not exceeding) the core count, keeping the vector
+        // width >= 32 elements. Too many tiles would make the busiest core run 2+ tiles serially.
+        int64_t perCore = (width + coreNumAiv - 1) / coreNumAiv;
+        int64_t colTileWidth = ((perCore + 7) / 8) * 8; // 32B aligned for AccT=float
+        if (colTileWidth < MIN_COL_TILE_WIDTH) {
+            colTileWidth = MIN_COL_TILE_WIDTH;
+        }
+        if (colTileWidth > MAX_COL_TILE_WIDTH) {
+            colTileWidth = MAX_COL_TILE_WIDTH;
+        }
+        if (colTileWidth > width) {
+            colTileWidth = width;
+        }
         int64_t colTileCount = (width + colTileWidth - 1) / colTileWidth;
         int64_t activeCoreNum = std::min(coreNumAiv, std::max(height, colTileCount));
         if (activeCoreNum < 1) {

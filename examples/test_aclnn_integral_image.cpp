@@ -630,8 +630,28 @@ int RunAll(aclrtStream stream)
 #endif
 }
 
+// Debug helper: run only the fp32 480x640 case (isolates the two-phase hang).
+int RunCase16Only(aclrtStream stream)
+{
+    constexpr int64_t H = 480;
+    constexpr int64_t W = 640;
+    std::vector<float> in(H * W);
+    for (int64_t i = 0; i < H * W; i++) {
+        in[i] = static_cast<float>((i * 7 % 97)) * 0.125f;
+    }
+    std::vector<double> exp((H + 1) * (W + 1), 0);
+    for (int64_t i = 1; i <= H; i++) {
+        for (int64_t j = 1; j <= W; j++) {
+            exp[i * (W + 1) + j] = exp[(i - 1) * (W + 1) + j] + exp[i * (W + 1) + j - 1] -
+                                   exp[(i - 1) * (W + 1) + j - 1] + in[(i - 1) * W + (j - 1)];
+        }
+    }
+    return RunCaseT<float, float>(stream, H, W, in, ACL_FLOAT, ACL_FLOAT, exp);
+}
+
 int main(int argc, char* argv[])
 {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     int32_t deviceId = 0;
     aclrtStream stream;
     auto ret = Init(deviceId, &stream);
@@ -645,6 +665,8 @@ int main(int argc, char* argv[])
         }
         std::cout << "==== IntegralImage benchmark mode, iters=" << iters << " ====" << std::endl;
         ret = RunBench(stream, iters);
+    } else if ((argc >= 2) && (std::string(argv[1]) == "case16")) {
+        ret = RunCase16Only(stream);
     } else {
         ret = RunAll(stream);
     }
