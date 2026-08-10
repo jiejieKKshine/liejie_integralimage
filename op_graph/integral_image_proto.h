@@ -31,12 +31,18 @@ namespace ge {
 *sat: A ND Tensor. Must be one of the following types: int32, float32.
 *     Shape (H+1,W+1) or (H+1,W+1,C) with a physical zero-padded top row and
 *     left column (OpenCV convention): sat[0][*]=sat[*][0]=0.
+*@par Attributes:
+*sdepth: An optional int32, output sum depth selector (OpenCV sdepth semantics):
+*        -1 (default) auto: uint8->int32, float16/float32->float32;
+*        0 = int32 (uint8 input only); 1 = float32 (all supported inputs);
+*        2 = float64 (not supported yet on Ascend 910B).
 *@par Third-party framework compatibility
 *Compatible with OpenCV cv::integral / NVIDIA NPP nppiIntegral / MATLAB integralImage.
 */
 REG_OP(IntegralImage)
     .INPUT(image, TensorType({DT_UINT8, DT_FLOAT16, DT_FLOAT}))
     .OUTPUT(sat, TensorType({DT_INT32, DT_FLOAT, DT_FLOAT}))
+    .ATTR(sdepth, Int, -1)
     .OP_END_FACTORY_REG(IntegralImage)
 
 } // namespace ge

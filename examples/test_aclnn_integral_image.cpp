@@ -21,6 +21,7 @@
 #include <numeric>
 #include <string>
 #include <cstdlib>
+#include <utility>
 #include "acl/acl.h"
 #include "aclnn_integral_image.h"
 
@@ -95,7 +96,7 @@ uint16_t FloatToHalf(float f)
 // 通用 2D 用例：输入 InT、输出 OutT，期望值以 double 存储（int/float 统一比较）
 template <typename InT, typename OutT>
 int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& input, aclDataType inAclType,
-             aclDataType outAclType, const std::vector<double>& expected)
+             aclDataType outAclType, const std::vector<double>& expected, int64_t sdepth = -1)
 {
     const int64_t OH = H + 1;
     const int64_t OW = W + 1;
@@ -114,7 +115,7 @@ int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& i
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
-    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, satTensor, &workspaceSize, &executor);
+    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, sdepth, satTensor, &workspaceSize, &executor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "GetWorkspaceSize failed: " << ret << std::endl; return ret);
     void* workspaceAddr = nullptr;
     if (workspaceSize > 0) {
@@ -181,7 +182,8 @@ int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& i
 // 通用 3D 用例：输入 (H,W,C)，输出 (H+1,W+1,C)（HWC 布局）
 template <typename InT, typename OutT>
 int RunCase3DT(aclrtStream stream, int64_t C, int64_t H, int64_t W, const std::vector<InT>& input,
-               aclDataType inAclType, aclDataType outAclType, const std::vector<double>& expected)
+               aclDataType inAclType, aclDataType outAclType, const std::vector<double>& expected,
+               int64_t sdepth = -1)
 {
     const int64_t OH = H + 1;
     const int64_t OW = W + 1;
@@ -200,7 +202,7 @@ int RunCase3DT(aclrtStream stream, int64_t C, int64_t H, int64_t W, const std::v
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
-    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, satTensor, &workspaceSize, &executor);
+    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, sdepth, satTensor, &workspaceSize, &executor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "GetWorkspaceSize failed: " << ret << std::endl; return ret);
 
     void* workspaceAddr = nullptr;
@@ -247,7 +249,11 @@ int RunCase3DT(aclrtStream stream, int64_t C, int64_t H, int64_t W, const std::v
 // 与 torch_npu 基线同口径：warmup 3 次，迭代 iters 次，取中位数（微秒）。
 // 计时区域 = aclnnIntegralImage 下发 + aclrtSynchronizeStream 等待完成。
 template <typename InT, typename OutT>
-double BenchShape(aclrtStream stream, int64_t H, int64_t W, aclDataType inAclType, aclDataType outAclType, int iters)
+// 返回 {e2e_us, device_us}：
+//   e2e_us    = aclnnIntegralImage 下发 + aclrtSynchronizeStream 等待完成（host 墙钟）
+//   device_us = aclrtEvent 时间戳，纯设备侧 kernel 执行时间（验收主口径）
+std::pair<double, double> BenchShape(aclrtStream stream, int64_t H, int64_t W,
+                                     aclDataType inAclType, aclDataType outAclType, int iters)
 {
     const int64_t OH = H + 1;
     const int64_t OW = W + 1;
@@ -268,69 +274,138 @@ double BenchShape(aclrtStream stream, int64_t H, int64_t W, aclDataType inAclTyp
     std::vector<int64_t> outShape = {OH, OW};
 
     int ret = CreateAclTensor(input, inShape, &imageDev, inAclType, &imageTensor);
-    CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create image tensor failed" << std::endl; return -1.0);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create image tensor failed" << std::endl;
+              return std::make_pair(-1.0, -1.0));
     ret = CreateAclTensor(std::vector<OutT>(), outShape, &satDev, outAclType, &satTensor);
-    CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create sat tensor failed" << std::endl; return -1.0);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create sat tensor failed" << std::endl;
+              return std::make_pair(-1.0, -1.0));
+
+    aclrtEvent startEv = nullptr;
+    aclrtEvent endEv = nullptr;
+    ret = aclrtCreateEvent(&startEv);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create start event failed: " << ret << std::endl;
+              return std::make_pair(-1.0, -1.0));
+    ret = aclrtCreateEvent(&endEv);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create end event failed: " << ret << std::endl;
+              return std::make_pair(-1.0, -1.0));
 
     const int warmup = 3;
     for (int i = 0; i < warmup; i++) {
         uint64_t wsSizeTmp = 0;
         aclOpExecutor* exTmp = nullptr;
-        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, satTensor, &wsSizeTmp, &exTmp);
-        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: GetWorkspaceSize failed: " << ret << std::endl; return -1.0);
+        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, &wsSizeTmp, &exTmp);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: GetWorkspaceSize failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
         void* wsTmp = nullptr;
         if (wsSizeTmp > 0) {
             ret = aclrtMalloc(&wsTmp, wsSizeTmp, ACL_MEM_MALLOC_HUGE_FIRST);
-            CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: workspace malloc failed" << std::endl; return -1.0);
+            CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: workspace malloc failed" << std::endl;
+                      return std::make_pair(-1.0, -1.0));
         }
         ret = aclnnIntegralImage(wsTmp, wsSizeTmp, exTmp, stream);
         CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: aclnnIntegralImage failed: " << ret << std::endl;
-                  return -1.0);
+                  return std::make_pair(-1.0, -1.0));
         ret = aclrtSynchronizeStream(stream);
-        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: sync stream failed: " << ret << std::endl; return -1.0);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: sync stream failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
         if (wsSizeTmp > 0) {
             aclrtFree(wsTmp);
         }
     }
 
-    std::vector<double> times;
-    times.reserve(iters);
+    std::vector<double> e2eTimes;
+    std::vector<double> devTimes;
+    e2eTimes.reserve(iters);
+    devTimes.reserve(iters);
+
+    // Pass 1：e2e = aclnnIntegralImage 下发 + aclrtSynchronizeStream 等待完成（host 墙钟）。
+    // 与 torch_npu 基线墙钟同语义；不掺入事件调用（record 在本平台有 ~ms 级 host 阻塞开销）。
     for (int i = 0; i < iters; i++) {
         ret = aclrtSynchronizeStream(stream);
-        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: sync stream failed: " << ret << std::endl; return -1.0);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: sync stream failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
         uint64_t wsSizeTmp = 0;
         aclOpExecutor* exTmp = nullptr;
-        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, satTensor, &wsSizeTmp, &exTmp);
-        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: GetWorkspaceSize failed: " << ret << std::endl; return -1.0);
+        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, &wsSizeTmp, &exTmp);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: GetWorkspaceSize failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
         void* wsTmp = nullptr;
         if (wsSizeTmp > 0) {
             ret = aclrtMalloc(&wsTmp, wsSizeTmp, ACL_MEM_MALLOC_HUGE_FIRST);
-            CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: workspace malloc failed" << std::endl; return -1.0);
+            CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: workspace malloc failed" << std::endl;
+                      return std::make_pair(-1.0, -1.0));
         }
         auto t0 = std::chrono::steady_clock::now();
         ret = aclnnIntegralImage(wsTmp, wsSizeTmp, exTmp, stream);
         CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: aclnnIntegralImage failed: " << ret << std::endl;
-                  return -1.0);
+                  return std::make_pair(-1.0, -1.0));
         ret = aclrtSynchronizeStream(stream);
-        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: sync stream failed: " << ret << std::endl; return -1.0);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: sync stream failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
         auto t1 = std::chrono::steady_clock::now();
-        times.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        e2eTimes.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
         if (wsSizeTmp > 0) {
             aclrtFree(wsTmp);
         }
     }
 
-    std::sort(times.begin(), times.end());
-    double med = times[iters / 2];
-    std::cout << "op integral_image " << typeid(InT).name() << "->" << typeid(OutT).name() << " H=" << H << " W=" << W
-              << ": median=" << med << " us (min=" << times.front() << ", max=" << times.back() << ", n=" << iters
-              << ")" << std::endl;
+    // Pass 2：device = aclrtEvent 时间戳（start 事件先于 kernel 入队，end 事件后于 kernel 入队，
+    // 在流上顺序执行，两者间隔即设备侧 kernel 执行时间；验收主口径）。
+    for (int i = 0; i < iters; i++) {
+        ret = aclrtSynchronizeStream(stream);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: sync stream failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
+        uint64_t wsSizeTmp = 0;
+        aclOpExecutor* exTmp = nullptr;
+        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, &wsSizeTmp, &exTmp);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: GetWorkspaceSize failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
+        void* wsTmp = nullptr;
+        if (wsSizeTmp > 0) {
+            ret = aclrtMalloc(&wsTmp, wsSizeTmp, ACL_MEM_MALLOC_HUGE_FIRST);
+            CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: workspace malloc failed" << std::endl;
+                      return std::make_pair(-1.0, -1.0));
+        }
+        ret = aclrtRecordEvent(startEv, stream);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: record start event failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
+        ret = aclnnIntegralImage(wsTmp, wsSizeTmp, exTmp, stream);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: aclnnIntegralImage failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
+        ret = aclrtRecordEvent(endEv, stream);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: record end event failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
+        ret = aclrtSynchronizeStream(stream);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: sync stream failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
+        float devMs = 0.0f;
+        ret = aclrtEventElapsedTime(&devMs, startEv, endEv);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: event elapsed failed: " << ret << std::endl;
+                  return std::make_pair(-1.0, -1.0));
+        devTimes.push_back(devMs * 1000.0);
+        if (wsSizeTmp > 0) {
+            aclrtFree(wsTmp);
+        }
+    }
 
+    std::sort(e2eTimes.begin(), e2eTimes.end());
+    std::sort(devTimes.begin(), devTimes.end());
+    double medE2e = e2eTimes[iters / 2];
+    double medDev = devTimes[iters / 2];
+    std::cout << "op integral_image " << typeid(InT).name() << "->" << typeid(OutT).name() << " H=" << H << " W=" << W
+              << ": e2e median=" << medE2e << " us (min=" << e2eTimes.front() << ", max=" << e2eTimes.back()
+              << ", n=" << iters << ")" << std::endl;
+    std::cout << "op integral_image " << typeid(InT).name() << "->" << typeid(OutT).name() << " H=" << H << " W=" << W
+              << ": device median=" << medDev << " us (min=" << devTimes.front() << ", max=" << devTimes.back()
+              << ", n=" << iters << ")" << std::endl;
+
+    aclrtDestroyEvent(startEv);
+    aclrtDestroyEvent(endEv);
     aclDestroyTensor(imageTensor);
     aclDestroyTensor(satTensor);
     aclrtFree(imageDev);
     aclrtFree(satDev);
-    return med;
+    return {medE2e, medDev};
 }
 
 int RunBench(aclrtStream stream, int iters)
@@ -338,19 +413,76 @@ int RunBench(aclrtStream stream, int iters)
     // 主口径：uint8 -> int32（与 torch_npu cumsum int32 基线同输出类型、同尺寸）
     int64_t sizes[][2] = {{1024, 1024}, {2048, 2048}, {4096, 4096}};
     for (auto& s : sizes) {
-        double t = BenchShape<uint8_t, int32_t>(stream, s[0], s[1], ACL_UINT8, ACL_INT32, iters);
-        if (t < 0) {
+        auto t = BenchShape<uint8_t, int32_t>(stream, s[0], s[1], ACL_UINT8, ACL_INT32, iters);
+        if (t.first < 0) {
             return 1;
         }
     }
     // 附：fp32 -> fp32 同尺寸（可另与 torch cumsum fp32 口径对比）
     for (auto& s : sizes) {
-        double t = BenchShape<float, float>(stream, s[0], s[1], ACL_FLOAT, ACL_FLOAT, iters);
-        if (t < 0) {
+        auto t = BenchShape<float, float>(stream, s[0], s[1], ACL_FLOAT, ACL_FLOAT, iters);
+        if (t.first < 0) {
             return 1;
         }
     }
     return 0;
+}
+
+// sdepth 属性负向校验：非法组合应在 GetWorkspaceSize/tiling 阶段被拒绝
+int RunAttrNegativeTests(aclrtStream stream)
+{
+    int ret = 0;
+    // fp16 输入 + sdepth=0(int32)：非法（int32 仅允许 uint8 输入）
+    {
+        constexpr int64_t H = 8;
+        constexpr int64_t W = 64;
+        std::vector<uint16_t> in(H * W, FloatToHalf(1.0f));
+        aclTensor* imageTensor = nullptr;
+        aclTensor* satTensor = nullptr;
+        void* imageDev = nullptr;
+        void* satDev = nullptr;
+        std::vector<int64_t> inShape = {H, W};
+        std::vector<int64_t> outShape = {H + 1, W + 1};
+        CHECK_RET(CreateAclTensor(in, inShape, &imageDev, ACL_FLOAT16, &imageTensor) == ACL_SUCCESS, return 1);
+        CHECK_RET(CreateAclTensor(std::vector<float>(), outShape, &satDev, ACL_FLOAT, &satTensor) == ACL_SUCCESS,
+                  return 1);
+        uint64_t ws = 0;
+        aclOpExecutor* ex = nullptr;
+        auto r = aclnnIntegralImageGetWorkspaceSize(imageTensor, 0, satTensor, &ws, &ex);
+        bool ok = (r != ACL_SUCCESS);
+        std::cout << (ok ? "[PASS]" : "[FAIL]") << " attr-neg: fp16+sdepth=0 rejected (ret=" << r << ")" << std::endl;
+        ret |= ok ? 0 : 1;
+        aclDestroyTensor(imageTensor);
+        aclDestroyTensor(satTensor);
+        aclrtFree(imageDev);
+        aclrtFree(satDev);
+    }
+    // u8 输入 + sdepth=2(float64)：910B 暂不支持
+    {
+        constexpr int64_t H = 8;
+        constexpr int64_t W = 64;
+        std::vector<uint8_t> in(H * W, 1);
+        aclTensor* imageTensor = nullptr;
+        aclTensor* satTensor = nullptr;
+        void* imageDev = nullptr;
+        void* satDev = nullptr;
+        std::vector<int64_t> inShape = {H, W};
+        std::vector<int64_t> outShape = {H + 1, W + 1};
+        CHECK_RET(CreateAclTensor(in, inShape, &imageDev, ACL_UINT8, &imageTensor) == ACL_SUCCESS, return 1);
+        CHECK_RET(CreateAclTensor(std::vector<float>(), outShape, &satDev, ACL_FLOAT, &satTensor) == ACL_SUCCESS,
+                  return 1);
+        uint64_t ws = 0;
+        aclOpExecutor* ex = nullptr;
+        auto r = aclnnIntegralImageGetWorkspaceSize(imageTensor, 2, satTensor, &ws, &ex);
+        bool ok = (r != ACL_SUCCESS);
+        std::cout << (ok ? "[PASS]" : "[FAIL]") << " attr-neg: u8+sdepth=2 rejected (ret=" << r << ")" << std::endl;
+        ret |= ok ? 0 : 1;
+        aclDestroyTensor(imageTensor);
+        aclDestroyTensor(satTensor);
+        aclrtFree(imageDev);
+        aclrtFree(satDev);
+    }
+    return ret;
 }
 
 int RunAll(aclrtStream stream)
@@ -369,6 +501,20 @@ int RunAll(aclrtStream stream)
             }
         }
         ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp);
+    }
+
+    // 用例 1b：uint8 8x64 全 1，sdepth=1 -> float32 输出（OpenCV sdepth 属性：显式指定输出深度）
+    {
+        constexpr int64_t H = 8;
+        constexpr int64_t W = 64;
+        std::vector<uint8_t> in(H * W, 1);
+        std::vector<double> exp((H + 1) * (W + 1), 0);
+        for (int64_t i = 1; i <= H; i++) {
+            for (int64_t j = 1; j <= W; j++) {
+                exp[i * (W + 1) + j] = static_cast<double>(i) * j;
+            }
+        }
+        ret |= RunCaseT<uint8_t, float>(stream, H, W, in, ACL_UINT8, ACL_FLOAT, exp, 1);
     }
 
 #ifndef DUMP_SAT
@@ -637,6 +783,7 @@ int RunAll(aclrtStream stream)
         ret |= RunCaseT<float, float>(stream, H, W, in, ACL_FLOAT, ACL_FLOAT, exp);
     }
 
+    ret |= RunAttrNegativeTests(stream);
     return ret;
 #endif
 }
@@ -703,7 +850,7 @@ int VerifyShapeT(aclrtStream stream, int64_t H, int64_t W, aclDataType inAclType
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
-    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, satTensor, &workspaceSize, &executor);
+    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, &workspaceSize, &executor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: GetWorkspaceSize failed: " << ret << std::endl; return ret);
     void* workspaceAddr = nullptr;
     if (workspaceSize > 0) {

@@ -21,18 +21,22 @@
 // 0: uint8   -> INT32 累加
 // 1: float16 -> FP32 累加
 // 2: float32 -> FP32 累加
+// 3: uint8   -> FP32 累加（sdepth 显式指定 float32）
 #define INTEGRAL_IMAGE_TPL_SCH_MODE_U8_I32 0
 #define INTEGRAL_IMAGE_TPL_SCH_MODE_F16_F32 1
 #define INTEGRAL_IMAGE_TPL_SCH_MODE_F32_F32 2
+#define INTEGRAL_IMAGE_TPL_SCH_MODE_U8_F32 3
 
 ASCENDC_TPL_ARGS_DECL(IntegralImage, ASCENDC_TPL_UINT_DECL(schMode, 2, ASCENDC_TPL_UI_LIST,
                                                            INTEGRAL_IMAGE_TPL_SCH_MODE_U8_I32,
                                                            INTEGRAL_IMAGE_TPL_SCH_MODE_F16_F32,
-                                                           INTEGRAL_IMAGE_TPL_SCH_MODE_F32_F32));
+                                                           INTEGRAL_IMAGE_TPL_SCH_MODE_F32_F32,
+                                                           INTEGRAL_IMAGE_TPL_SCH_MODE_U8_F32));
 
 ASCENDC_TPL_SEL(ASCENDC_TPL_ARGS_SEL(ASCENDC_TPL_UINT_SEL(schMode, ASCENDC_TPL_UI_LIST,
                                                           INTEGRAL_IMAGE_TPL_SCH_MODE_U8_I32,
                                                           INTEGRAL_IMAGE_TPL_SCH_MODE_F16_F32,
-                                                          INTEGRAL_IMAGE_TPL_SCH_MODE_F32_F32)));
+                                                          INTEGRAL_IMAGE_TPL_SCH_MODE_F32_F32,
+                                                          INTEGRAL_IMAGE_TPL_SCH_MODE_U8_F32)));
 
 #endif // __INTEGRAL_IMAGE_TILING_KEY_H__

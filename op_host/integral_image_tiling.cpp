@@ -75,6 +75,26 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
         return ge::GRAPH_FAILED;
     }
     auto inDtype = context->GetInputDesc(INDEXZERO)->GetDataType();
+    // sdepth（OpenCV 语义）：-1 自动（u8->int32，fp16/fp32->float32）；0=int32；1=float32；
+    // 2=float64（910B 向量单元不支持 double，暂拒绝）。
+    int64_t sdepth = -1;
+    auto attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        auto p = attrs->GetAttrPointer<int64_t>(0);
+        if (p != nullptr) {
+            sdepth = *p;
+        }
+    }
+    if (sdepth != -1 && sdepth != 0 && sdepth != 1) {
+        OP_LOGE(context, "IntegralImage: unsupported sdepth=%ld (expect -1/0/1; float64 not supported on 910B)",
+                sdepth);
+        return ge::GRAPH_FAILED;
+    }
+    if (sdepth == 0 && inDtype != ge::DT_UINT8) {
+        OP_LOGE(context, "IntegralImage: sdepth=int32 is only valid for uint8 input");
+        return ge::GRAPH_FAILED;
+    }
+    const bool outF32 = (sdepth == 1);
     const int64_t accBytes = 4;
     int64_t inBytes = (inDtype == ge::DT_UINT8) ? 1 : ((inDtype == ge::DT_FLOAT16) ? 2 : 4);
 
@@ -162,7 +182,8 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
 
     uint64_t tilingKey = 0;
     if (inDtype == ge::DT_UINT8) {
-        tilingKey = GET_TPL_TILING_KEY(INTEGRAL_IMAGE_TPL_SCH_MODE_U8_I32);
+        tilingKey = outF32 ? GET_TPL_TILING_KEY(INTEGRAL_IMAGE_TPL_SCH_MODE_U8_F32)
+                           : GET_TPL_TILING_KEY(INTEGRAL_IMAGE_TPL_SCH_MODE_U8_I32);
     } else if (inDtype == ge::DT_FLOAT16) {
         tilingKey = GET_TPL_TILING_KEY(INTEGRAL_IMAGE_TPL_SCH_MODE_F16_F32);
     } else if (inDtype == ge::DT_FLOAT) {

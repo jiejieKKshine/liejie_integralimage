@@ -31,8 +31,13 @@ __global__ __aicore__ void integral_image(
         NsIntegralImage::IntegralImage<half, float> op;
         op.Init(image, sat, workspace, &tilingData);
         op.Process();
-    } else {
+    } else if constexpr (schMode == INTEGRAL_IMAGE_TPL_SCH_MODE_F32_F32) {
         NsIntegralImage::IntegralImage<float, float> op;
+        op.Init(image, sat, workspace, &tilingData);
+        op.Process();
+    } else {
+        // INTEGRAL_IMAGE_TPL_SCH_MODE_U8_F32: uint8 input, float32 output (sdepth=1)
+        NsIntegralImage::IntegralImage<uint8_t, float> op;
         op.Init(image, sat, workspace, &tilingData);
         op.Process();
     }

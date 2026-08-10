@@ -35,6 +35,10 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();
 
+        // sdepth: 输出深度选择（OpenCV 语义）。-1 自动（u8->int32，fp16/fp32->float32）；
+        // 0=int32（仅 uint8 输入）；1=float32；2=float64（910B 暂不支持，tiling 校验拒绝）。
+        this->Attr("sdepth").AttrType(OPTIONAL).Int(-1);
+
         OpAICoreConfig aicoreConfig;
         aicoreConfig
             .DynamicCompileStaticFlag(true)

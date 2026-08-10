@@ -331,7 +331,8 @@ __aicore__ inline void IntegralImage<InT, AccT>::ExtractChannel(LocalTensor<AccT
     int32_t c, int32_t channel, int32_t len)
 {
     for (int32_t i = 0; i < len; i++) {
-        dst.SetValue(i, static_cast<AccT>(src.GetValue(c + i * channel)));
+        // aicore 不允许 float <-> uint8 直接 cast，统一经 int32 中转
+        dst.SetValue(i, static_cast<AccT>(static_cast<int32_t>(src.GetValue(c + i * channel))));
     }
 }
 
@@ -341,7 +342,7 @@ __aicore__ inline AccT IntegralImage<InT, AccT>::SumChannel(const LocalTensor<In
 {
     AccT sum = static_cast<AccT>(0);
     for (int32_t i = 0; i < len; i++) {
-        sum += static_cast<AccT>(src.GetValue(c + i * channel));
+        sum += static_cast<AccT>(static_cast<int32_t>(src.GetValue(c + i * channel)));
     }
     return sum;
 }
@@ -366,7 +367,7 @@ __aicore__ inline void IntegralImage<InT, AccT>::CastVec2D(const LocalTensor<Acc
     } else if constexpr (std::is_same<InT, uint8_t>::value) {
         // u8 -> s32: scalar Cast (count/mask-array u8 vector Cast is a known HW defect on this platform)
         for (int32_t i = 0; i < len; i++) {
-            dst.SetValue(i, static_cast<AccT>(src.GetValue(i)));
+            dst.SetValue(i, static_cast<AccT>(static_cast<int32_t>(src.GetValue(i))));
         }
     } else {
         // fp16 -> fp32
@@ -426,7 +427,7 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
                     for (int32_t k = 0; k < rows; k++) {
                         AccT running = carryVals[k];
                         for (int32_t i = 0; i < tileW; i++) {
-                            running += static_cast<AccT>(imgBatchLocal_.GetValue(k * tileW + i));
+                            running += static_cast<AccT>(static_cast<int32_t>(imgBatchLocal_.GetValue(k * tileW + i)));
                             dstBatchLocal_.SetValue(k * tileW + i, running);
                         }
                         carryVals[k] = running;
@@ -447,7 +448,7 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
                         AscendC::WaitFlag<HardEvent::MTE2_S>(evMte2S_);
                         AccT running = carryVals[k];
                         for (int32_t i = 0; i < tileW; i++) {
-                            running += static_cast<AccT>(imgLocal_.GetValue(i));
+                            running += static_cast<AccT>(static_cast<int32_t>(imgLocal_.GetValue(i)));
                             castLocal_.SetValue(i, running);
                         }
                         carryVals[k] = running;
