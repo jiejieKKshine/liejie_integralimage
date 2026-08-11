@@ -41,11 +41,14 @@ static ge::graphStatus InferShapeIntegralImage(gert::InferShapeContext* context)
     OP_CHECK_NULL_WITH_CONTEXT(context, inputShape);
     gert::Shape* outputShape = context->GetOutputShape(IDX_0);
     OP_CHECK_NULL_WITH_CONTEXT(context, outputShape);
+    gert::Shape* sqsumShape = context->GetOutputShape(1);
+    OP_CHECK_NULL_WITH_CONTEXT(context, sqsumShape);
 
     // 动态 rank（-2）：输出透传 UnknownRank
     if (Ops::Base::IsUnknownRank(*inputShape)) {
         OP_LOGD(context->GetNodeName(), "input is UnknownRank, set output as UnknownRank.");
         Ops::Base::SetUnknownRank(*outputShape);
+        Ops::Base::SetUnknownRank(*sqsumShape);
         return GRAPH_SUCCESS;
     }
 
@@ -55,6 +58,7 @@ static ge::graphStatus InferShapeIntegralImage(gert::InferShapeContext* context)
         return GRAPH_FAILED;
     }
     outputShape->SetDimNum(dimNum);
+    sqsumShape->SetDimNum(dimNum);
     for (size_t i = 0; i < dimNum; i++) {
         int64_t dim = inputShape->GetDim(i);
         // 第 0/1 维是 H、W，各 +1（HWC：C 在最后一维，不变）；动态维度保持未知
@@ -62,6 +66,7 @@ static ge::graphStatus InferShapeIntegralImage(gert::InferShapeContext* context)
             dim += 1;
         }
         outputShape->SetDim(i, dim);
+        sqsumShape->SetDim(i, dim);
     }
 
     OP_LOGD(context->GetNodeName(), "End to do InferShapeIntegralImage");

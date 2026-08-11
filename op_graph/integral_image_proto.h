@@ -31,6 +31,10 @@ namespace ge {
 *sat: A ND Tensor. Must be one of the following types: int32, float32.
 *     Shape (H+1,W+1) or (H+1,W+1,C) with a physical zero-padded top row and
 *     left column (OpenCV convention): sat[0][*]=sat[*][0]=0.
+*sqsum: A ND Tensor. Must be float32 (910B vector unit has no double support;
+*       OpenCV default sqdepth=CV_64F is approximated by fp32 here).
+*       Same shape as sat: integral image of squared pixel values, i.e.
+*       sqsum[y+1][x+1] = sum_{yy<=y, xx<=x} src[yy][xx]^2 (OpenCV integral2).
 *@par Attributes:
 *sdepth: An optional int32, output sum depth selector (OpenCV sdepth semantics):
 *        -1 (default) auto: uint8->int32, float16/float32->float32;
@@ -42,6 +46,7 @@ namespace ge {
 REG_OP(IntegralImage)
     .INPUT(image, TensorType({DT_UINT8, DT_FLOAT16, DT_FLOAT}))
     .OUTPUT(sat, TensorType({DT_INT32, DT_FLOAT, DT_FLOAT}))
+    .OUTPUT(sqsum, TensorType({DT_FLOAT}))
     .ATTR(sdepth, Int, -1)
     .OP_END_FACTORY_REG(IntegralImage)
 

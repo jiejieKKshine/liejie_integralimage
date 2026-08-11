@@ -110,7 +110,9 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
         // ---- two-phase path: phase A per-row horizontal scan, phase B per-column vertical add ----
         // UB budget must also reserve the phase-A batch buffers and the CumSum LCM tmp
         // (TPipe allocates all UB positions from one pool; PopStackBuffer(LCM) takes the tail).
-        const int64_t kFixedUb = 56 * 1024;
+        // fixed UB = legacy buffers (~90KB with sqsum phase-B additions):
+        // wsBatch/out/wsSqBatch/outSq 8*(colTileW+8)*4*4 + rows/cols/acc/zero/left/cast etc.
+        const int64_t kFixedUb = 96 * 1024;
         const bool fpPath = (inDtype == ge::DT_FLOAT16 || inDtype == ge::DT_FLOAT);
         int64_t rowTileWidth = MAX_BLOCK_WIDTH;
         int64_t ubBudget = static_cast<int64_t>(ubSize) * 9 / 10;
@@ -119,7 +121,12 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
             if (fpPath) {
                 int64_t extraCast = (inDtype == ge::DT_FLOAT16) ? accBytes : 0;
                 batchBytes = 8LL * (rowTileWidth + 8) * (inBytes + accBytes + extraCast) +
-                             8LL * rowTileWidth * accBytes * 2; // CumSum LCM tmp
+                             8LL * rowTileWidth * accBytes * 2 + // CumSum LCM tmp
+                             8LL * rowTileWidth * accBytes * 2 + // sqsum: sqSrcBatch + dstSqBatch
+                             rowTileWidth * accBytes;            // sqsum column accumulator (accSq)
+            } else {
+                // u8: imgBatch(InT) + dstBatch + dstSqBatch(float32) + sqsum accumulator
+                batchBytes = 8LL * (rowTileWidth + 8) * (inBytes + 2 * accBytes) + rowTileWidth * accBytes;
             }
             if (kFixedUb + batchBytes <= ubBudget) {
                 break;
@@ -158,7 +165,8 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
 
         size_t* ws = context->GetWorkspaceSizes(1);
         OP_CHECK_NULL_WITH_CONTEXT(context, ws);
-        ws[0] = static_cast<size_t>(RESERVED_WORKSPACE_BYTES + height * width * accBytes);
+        // workspace layout: [0, H*W) sum row prefixes, [H*W, 2*H*W) sqsum row prefixes
+        ws[0] = static_cast<size_t>(RESERVED_WORKSPACE_BYTES + height * width * accBytes * 2);
     } else {
         // ---- legacy path: per-column block multi-core (2D small W or 3D HWC) ----
         int64_t ubBudget = static_cast<int64_t>(ubSize) * 7 / 10;
