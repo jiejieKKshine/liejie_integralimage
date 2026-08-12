@@ -37,9 +37,21 @@ public:
 
         // sqsum: 像素平方积分图（OpenCV integral2 语义），float32 输出。
         // 910B 向量单元不支持 double，故用 fp32 近似 OpenCV 默认 CV_64F。
+        // OPTIONAL 输出：调用方不传（空 tensor）时 kernel 跳过 sqsum 计算，
+        // 与 OpenCV integral（只 sum）形态对齐。
         this->Output("sqsum")
-            .ParamType(REQUIRED)
+            .ParamType(OPTIONAL)
             .DataType({ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+            .AutoContiguous();
+
+        // tilted: 45° 旋转积分图（OpenCV integral3 语义），输出类型与 sat 一致。
+        // 采用对角前缀分解的多核实现（主/反对角线各自独立）。
+        // OPTIONAL 输出：调用方不传（空 tensor）时 kernel 跳过 tilted 计算，主算子两路性能不受影响。
+        this->Output("tilted")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_INT32, ge::DT_FLOAT, ge::DT_FLOAT})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();

@@ -28,6 +28,8 @@ struct IntegralImageTilingData {
     int64_t rowTileWidth = 0;    // phase A in-row tile width (UB bound, <= 1024)
     int64_t colTileWidth = 0;    // phase B column tile width (vector width)
     int64_t colTileCount = 0;    // phase B column tile count = ceil(W / colTileWidth)
+    int64_t sqsumEnabled = 1;    // optional sqsum output provided by the caller
+    int64_t tiltedEnabled = 1;   // optional tilted output provided by the caller
 };
 
 #endif // _INTEGRAL_IMAGE_TILING_DATA_H_

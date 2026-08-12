@@ -75,6 +75,27 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
         return ge::GRAPH_FAILED;
     }
     auto inDtype = context->GetInputDesc(INDEXZERO)->GetDataType();
+    // Optional outputs: disabled when the caller provides an empty tensor (rank 0 or zero dim).
+    int64_t sqsumEnabled = 1;
+    auto sqsumShape = context->GetOutputShape(1);
+    if (sqsumShape == nullptr) {
+        sqsumEnabled = 0;
+    } else {
+        auto sq = sqsumShape->GetShape();
+        if (sq.GetDimNum() == 0 || (sq.GetDimNum() == 1 && sq.GetDim(0) == 0)) {
+            sqsumEnabled = 0;
+        }
+    }
+    int64_t tiltedEnabled = 1;
+    auto tiltedShape = context->GetOutputShape(2);
+    if (tiltedShape == nullptr) {
+        tiltedEnabled = 0;
+    } else {
+        auto shp = tiltedShape->GetShape();
+        if (shp.GetDimNum() == 0 || (shp.GetDimNum() == 1 && shp.GetDim(0) == 0)) {
+            tiltedEnabled = 0;
+        }
+    }
     // sdepth（OpenCV 语义）：-1 自动（u8->int32，fp16/fp32->float32）；0=int32；1=float32；
     // 2=float64（910B 向量单元不支持 double，暂拒绝）。
     int64_t sdepth = -1;
@@ -105,6 +126,8 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
     tiling->height = height;
     tiling->width = width;
     tiling->channel = channel;
+    tiling->sqsumEnabled = sqsumEnabled;
+    tiling->tiltedEnabled = tiltedEnabled;
 
     if (channel == 1 && width >= TWO_PHASE_MIN_WIDTH) {
         // ---- two-phase path: phase A per-row horizontal scan, phase B per-column vertical add ----
@@ -165,8 +188,11 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
 
         size_t* ws = context->GetWorkspaceSizes(1);
         OP_CHECK_NULL_WITH_CONTEXT(context, ws);
-        // workspace layout: [0, H*W) sum row prefixes, [H*W, 2*H*W) sqsum row prefixes
-        ws[0] = static_cast<size_t>(RESERVED_WORKSPACE_BYTES + height * width * accBytes * 2);
+        // workspace layout:
+        //   [0, H*W)        sum row prefixes (AccT)
+        //   [H*W, 2*H*W)    sqsum row prefixes (float)
+        //   [2*H*W, 4*H*W)  tilted acc1 / acc2 diagonal-prefix buffers (AccT)
+        ws[0] = static_cast<size_t>(RESERVED_WORKSPACE_BYTES + height * width * accBytes * 4);
     } else {
         // ---- legacy path: per-column block multi-core (2D small W or 3D HWC) ----
         int64_t ubBudget = static_cast<int64_t>(ubSize) * 7 / 10;
@@ -186,6 +212,11 @@ static ge::graphStatus IntegralImageTilingFunc(gert::TilingContext* context)
         tiling->blockWidth = blockWidth;
         tiling->coreNum = coreNum;
         context->SetBlockDim(static_cast<uint32_t>(coreNum));
+        // tilted multi-core needs workspace: [0,H*W) row prefixes, [H*W,2*H*W) acc1,
+        // [2*H*W,3*H*W) acc2
+        size_t* ws = context->GetWorkspaceSizes(1);
+        OP_CHECK_NULL_WITH_CONTEXT(context, ws);
+        ws[0] = static_cast<size_t>(RESERVED_WORKSPACE_BYTES + height * width * accBytes * 3);
     }
 
     uint64_t tilingKey = 0;

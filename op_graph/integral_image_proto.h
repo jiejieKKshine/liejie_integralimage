@@ -35,6 +35,10 @@ namespace ge {
 *       OpenCV default sqdepth=CV_64F is approximated by fp32 here).
 *       Same shape as sat: integral image of squared pixel values, i.e.
 *       sqsum[y+1][x+1] = sum_{yy<=y, xx<=x} src[yy][xx]^2 (OpenCV integral2).
+*tilted: A ND Tensor with the same dtype as sat (OpenCV tilted, same sdepth).
+*        Same shape as sat: 45-degree rotated integral image (OpenCV integral3).
+*        Internal region matches the OpenCV recurrence; boundary column W and row H
+*        are defined as zero (OpenCV leaves them undefined).
 *@par Attributes:
 *sdepth: An optional int32, output sum depth selector (OpenCV sdepth semantics):
 *        -1 (default) auto: uint8->int32, float16/float32->float32;
@@ -47,6 +51,7 @@ REG_OP(IntegralImage)
     .INPUT(image, TensorType({DT_UINT8, DT_FLOAT16, DT_FLOAT}))
     .OUTPUT(sat, TensorType({DT_INT32, DT_FLOAT, DT_FLOAT}))
     .OUTPUT(sqsum, TensorType({DT_FLOAT}))
+    .OUTPUT(tilted, TensorType({DT_INT32, DT_FLOAT, DT_FLOAT}))
     .ATTR(sdepth, Int, -1)
     .OP_END_FACTORY_REG(IntegralImage)
 

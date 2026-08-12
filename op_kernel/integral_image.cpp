@@ -18,27 +18,27 @@
 
 template <uint32_t schMode>
 __global__ __aicore__ void integral_image(
-    GM_ADDR image, GM_ADDR sat, GM_ADDR sqsum, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR image, GM_ADDR sat, GM_ADDR sqsum, GM_ADDR tilted, GM_ADDR workspace, GM_ADDR tiling)
 {
     REGISTER_TILING_DEFAULT(IntegralImageTilingData);
     GET_TILING_DATA_WITH_STRUCT(IntegralImageTilingData, tilingData, tiling);
 
     if constexpr (schMode == INTEGRAL_IMAGE_TPL_SCH_MODE_U8_I32) {
         NsIntegralImage::IntegralImage<uint8_t, int32_t> op;
-        op.Init(image, sat, sqsum, workspace, &tilingData);
+        op.Init(image, sat, sqsum, tilted, workspace, &tilingData);
         op.Process();
     } else if constexpr (schMode == INTEGRAL_IMAGE_TPL_SCH_MODE_F16_F32) {
         NsIntegralImage::IntegralImage<half, float> op;
-        op.Init(image, sat, sqsum, workspace, &tilingData);
+        op.Init(image, sat, sqsum, tilted, workspace, &tilingData);
         op.Process();
     } else if constexpr (schMode == INTEGRAL_IMAGE_TPL_SCH_MODE_F32_F32) {
         NsIntegralImage::IntegralImage<float, float> op;
-        op.Init(image, sat, sqsum, workspace, &tilingData);
+        op.Init(image, sat, sqsum, tilted, workspace, &tilingData);
         op.Process();
     } else {
         // INTEGRAL_IMAGE_TPL_SCH_MODE_U8_F32: uint8 input, float32 output (sdepth=1)
         NsIntegralImage::IntegralImage<uint8_t, float> op;
-        op.Init(image, sat, sqsum, workspace, &tilingData);
+        op.Init(image, sat, sqsum, tilted, workspace, &tilingData);
         op.Process();
     }
 }

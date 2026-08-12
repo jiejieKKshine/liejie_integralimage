@@ -93,11 +93,72 @@ uint16_t FloatToHalf(float f)
     return static_cast<uint16_t>(sign | (static_cast<uint32_t>(e) << 10) | (mant >> 13));
 }
 
+// CPU reference for the tilted integral (closed-form inverted-triangle sum):
+//   tilted[y][x] = sum_{k<=y} sum_{j in [x-(y-k), x+(y-k)] clipped to [0,W)} src[k][j]
+// Boundaries: column W and row H are zero (defined by the kernel).
+template <typename InT>
+void ComputeTiltedRef(const std::vector<InT>& input, int64_t H, int64_t W, std::vector<double>& tilted)
+{
+    const int64_t OHW = W + 1;
+    tilted.assign((H + 1) * OHW, 0.0);
+    auto toD = [](InT v) -> double {
+        if constexpr (std::is_same<InT, uint16_t>::value) {
+            uint32_t sign = (static_cast<uint32_t>(v) & 0x8000u) << 16;
+            uint32_t exp = (static_cast<uint32_t>(v) >> 10) & 0x1Fu;
+            uint32_t mant = static_cast<uint32_t>(v) & 0x3FFu;
+            uint32_t f;
+            if (exp == 0) {
+                if (mant == 0) {
+                    f = sign;
+                } else {
+                    int e = -14;
+                    uint32_t m = mant;
+                    while ((m & 0x400u) == 0) {
+                        m <<= 1;
+                        e--;
+                    }
+                    m &= 0x3FFu;
+                    f = sign | (static_cast<uint32_t>(e + 127) << 23) | (m << 13);
+                }
+            } else if (exp == 31) {
+                f = sign | 0x7F800000u | (mant << 13);
+            } else {
+                f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+            }
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return static_cast<double>(out);
+        } else {
+            return static_cast<double>(v);
+        }
+    };
+    for (int64_t y = 0; y < H; y++) {
+        for (int64_t x = 0; x < W; x++) {
+            double s = 0.0;
+            for (int64_t k = 0; k <= y; k++) {
+                int64_t lo = x - (y - k);
+                int64_t hi = x + (y - k);
+                if (lo < 0) {
+                    lo = 0;
+                }
+                if (hi >= W) {
+                    hi = W - 1;
+                }
+                for (int64_t j = lo; j <= hi; j++) {
+                    s += toD(input[k * W + j]);
+                }
+            }
+            tilted[y * OHW + x] = s;
+        }
+    }
+}
+
 // 通用 2D 用例：输入 InT、输出 OutT，期望值以 double 存储（int/float 统一比较）
 template <typename InT, typename OutT>
 int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& input, aclDataType inAclType,
              aclDataType outAclType, const std::vector<double>& expected, int64_t sdepth = -1,
-             const std::vector<double>& expectedSq = {})
+             const std::vector<double>& expectedSq = {}, const std::vector<double>& expectedTilted = {},
+             bool withTilted = true, bool withSqsum = true)
 {
     const int64_t OH = H + 1;
     const int64_t OW = W + 1;
@@ -105,9 +166,11 @@ int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& i
     aclTensor* imageTensor = nullptr;
     aclTensor* satTensor = nullptr;
     aclTensor* sqsumTensor = nullptr;
+    aclTensor* tiltedTensor = nullptr;
     void* imageDev = nullptr;
     void* satDev = nullptr;
     void* sqsumDev = nullptr;
+    void* tiltedDev = nullptr;
     std::vector<int64_t> inShape = {H, W};
     std::vector<int64_t> outShape = {OH, OW};
 
@@ -115,12 +178,32 @@ int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& i
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "create image tensor failed" << std::endl; return ret);
     ret = CreateAclTensor(std::vector<OutT>(), outShape, &satDev, outAclType, &satTensor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "create sat tensor failed" << std::endl; return ret);
-    ret = CreateAclTensor(std::vector<float>(), outShape, &sqsumDev, ACL_FLOAT, &sqsumTensor);
-    CHECK_RET(ret == ACL_SUCCESS, std::cout << "create sqsum tensor failed" << std::endl; return ret);
+    if (withSqsum) {
+        ret = CreateAclTensor(std::vector<float>(), outShape, &sqsumDev, ACL_FLOAT, &sqsumTensor);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "create sqsum tensor failed" << std::endl; return ret);
+    } else {
+        std::vector<int64_t> emptyShape = {0};
+        std::vector<int64_t> emptyStrides = {0};
+        sqsumTensor = aclCreateTensor(emptyShape.data(), 1, ACL_FLOAT, emptyStrides.data(), 0,
+                                      aclFormat::ACL_FORMAT_ND, emptyShape.data(), 1, nullptr);
+        sqsumDev = nullptr;
+    }
+    if (withTilted) {
+        ret = CreateAclTensor(std::vector<OutT>(), outShape, &tiltedDev, outAclType, &tiltedTensor);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "create tilted tensor failed" << std::endl; return ret);
+    } else {
+        // optional output not requested: pass an empty tensor (shape [0])
+        std::vector<int64_t> emptyShape = {0};
+        std::vector<int64_t> emptyStrides = {0};
+        tiltedTensor = aclCreateTensor(emptyShape.data(), 1, outAclType, emptyStrides.data(), 0,
+                                       aclFormat::ACL_FORMAT_ND, emptyShape.data(), 1, nullptr);
+        tiltedDev = nullptr;
+    }
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
-    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, sdepth, satTensor, sqsumTensor, &workspaceSize, &executor);
+    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, sdepth, satTensor, sqsumTensor, tiltedTensor,
+                                            &workspaceSize, &executor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "GetWorkspaceSize failed: " << ret << std::endl; return ret);
     void* workspaceAddr = nullptr;
     if (workspaceSize > 0) {
@@ -137,10 +220,21 @@ int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& i
                       ACL_MEMCPY_DEVICE_TO_HOST);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "copy sat back failed: " << ret << std::endl; return ret);
 
-    std::vector<float> actualSq(OH * OW, 0);
-    ret = aclrtMemcpy(actualSq.data(), actualSq.size() * sizeof(float), sqsumDev, actualSq.size() * sizeof(float),
-                      ACL_MEMCPY_DEVICE_TO_HOST);
-    CHECK_RET(ret == ACL_SUCCESS, std::cout << "copy sqsum back failed: " << ret << std::endl; return ret);
+    std::vector<float> actualSq;
+    if (withSqsum) {
+        actualSq.assign(OH * OW, 0);
+        ret = aclrtMemcpy(actualSq.data(), actualSq.size() * sizeof(float), sqsumDev, actualSq.size() * sizeof(float),
+                          ACL_MEMCPY_DEVICE_TO_HOST);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "copy sqsum back failed: " << ret << std::endl; return ret);
+    }
+
+    std::vector<OutT> actualTilted;
+    if (withTilted) {
+        actualTilted.assign(OH * OW, 0);
+        ret = aclrtMemcpy(actualTilted.data(), actualTilted.size() * sizeof(OutT), tiltedDev,
+                          actualTilted.size() * sizeof(OutT), ACL_MEMCPY_DEVICE_TO_HOST);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "copy tilted back failed: " << ret << std::endl; return ret);
+    }
 
 
 #ifdef DUMP_SAT
@@ -177,7 +271,7 @@ int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& i
         }
     }
 
-    if (!expectedSq.empty()) {
+    if (withSqsum && !expectedSq.empty()) {
         for (int64_t i = 0; i < OH * OW; i++) {
             double got = static_cast<double>(actualSq[i]);
             double want = expectedSq[i];
@@ -191,16 +285,40 @@ int RunCaseT(aclrtStream stream, int64_t H, int64_t W, const std::vector<InT>& i
         }
     }
 
+    if (withTilted && !expectedTilted.empty()) {
+        for (int64_t i = 0; i < OH * OW; i++) {
+            double got = static_cast<double>(actualTilted[i]);
+            double want = expectedTilted[i];
+            double tol = (std::fabs(want) > 1.0) ? std::fabs(want) * 1e-4 : 1e-3;
+            if (std::fabs(got - want) > tol) {
+                ok = false;
+                std::cout << "tilted mismatch at " << i / OW << "," << i % OW << ": got " << got << " expected "
+                          << want << std::endl;
+                break;
+            }
+        }
+    }
+
 
     if (workspaceSize > 0) {
         aclrtFree(workspaceAddr);
     }
     aclDestroyTensor(imageTensor);
     aclDestroyTensor(satTensor);
-    aclDestroyTensor(sqsumTensor);
+    if (withSqsum) {
+        aclDestroyTensor(sqsumTensor);
+    }
+    if (withTilted) {
+        aclDestroyTensor(tiltedTensor);
+    }
     aclrtFree(imageDev);
     aclrtFree(satDev);
-    aclrtFree(sqsumDev);
+    if (withSqsum) {
+        aclrtFree(sqsumDev);
+    }
+    if (withTilted) {
+        aclrtFree(tiltedDev);
+    }
 
     std::cout << (ok ? "[PASS]" : "[FAIL]") << " IntegralImage " << typeid(InT).name() << " H=" << H << " W=" << W
               << std::endl;
@@ -219,9 +337,11 @@ int RunCase3DT(aclrtStream stream, int64_t C, int64_t H, int64_t W, const std::v
     aclTensor* imageTensor = nullptr;
     aclTensor* satTensor = nullptr;
     aclTensor* sqsumTensor = nullptr;
+    aclTensor* tiltedTensor = nullptr;
     void* imageDev = nullptr;
     void* satDev = nullptr;
     void* sqsumDev = nullptr;
+    void* tiltedDev = nullptr;
     std::vector<int64_t> inShape = {H, W, C};
     std::vector<int64_t> outShape = {OH, OW, C};
 
@@ -231,10 +351,13 @@ int RunCase3DT(aclrtStream stream, int64_t C, int64_t H, int64_t W, const std::v
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "create sat tensor failed" << std::endl; return ret);
     ret = CreateAclTensor(std::vector<float>(), outShape, &sqsumDev, ACL_FLOAT, &sqsumTensor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "create sqsum tensor failed" << std::endl; return ret);
+    ret = CreateAclTensor(std::vector<OutT>(), outShape, &tiltedDev, outAclType, &tiltedTensor);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "create tilted tensor failed" << std::endl; return ret);
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
-    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, sdepth, satTensor, sqsumTensor, &workspaceSize, &executor);
+    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, sdepth, satTensor, sqsumTensor, tiltedTensor,
+                                            &workspaceSize, &executor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "GetWorkspaceSize failed: " << ret << std::endl; return ret);
 
     void* workspaceAddr = nullptr;
@@ -256,6 +379,11 @@ int RunCase3DT(aclrtStream stream, int64_t C, int64_t H, int64_t W, const std::v
     ret = aclrtMemcpy(actualSq.data(), actualSq.size() * sizeof(float), sqsumDev, actualSq.size() * sizeof(float),
                       ACL_MEMCPY_DEVICE_TO_HOST);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "copy sqsum back failed: " << ret << std::endl; return ret);
+
+    std::vector<OutT> actualTilted(C * OH * OW, 0);
+    ret = aclrtMemcpy(actualTilted.data(), actualTilted.size() * sizeof(OutT), tiltedDev,
+                      actualTilted.size() * sizeof(OutT), ACL_MEMCPY_DEVICE_TO_HOST);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "copy tilted back failed: " << ret << std::endl; return ret);
 
 
     bool ok = true;
@@ -289,9 +417,11 @@ int RunCase3DT(aclrtStream stream, int64_t C, int64_t H, int64_t W, const std::v
     aclDestroyTensor(imageTensor);
     aclDestroyTensor(satTensor);
     aclDestroyTensor(sqsumTensor);
+    aclDestroyTensor(tiltedTensor);
     aclrtFree(imageDev);
     aclrtFree(satDev);
     aclrtFree(sqsumDev);
+    aclrtFree(tiltedDev);
 
     std::cout << (ok ? "[PASS]" : "[FAIL]") << " IntegralImage 3D " << typeid(InT).name() << " C=" << C << " H=" << H
               << " W=" << W << std::endl;
@@ -306,7 +436,8 @@ template <typename InT, typename OutT>
 //   e2e_us    = aclnnIntegralImage 下发 + aclrtSynchronizeStream 等待完成（host 墙钟）
 //   device_us = aclrtEvent 时间戳，纯设备侧 kernel 执行时间（验收主口径）
 std::pair<double, double> BenchShape(aclrtStream stream, int64_t H, int64_t W,
-                                     aclDataType inAclType, aclDataType outAclType, int iters)
+                                     aclDataType inAclType, aclDataType outAclType, int iters,
+                                     bool withTilted = true, bool withSqsum = true, int mode = 2)
 {
     const int64_t OH = H + 1;
     const int64_t OW = W + 1;
@@ -322,9 +453,11 @@ std::pair<double, double> BenchShape(aclrtStream stream, int64_t H, int64_t W,
     aclTensor* imageTensor = nullptr;
     aclTensor* satTensor = nullptr;
     aclTensor* sqsumTensor = nullptr;
+    aclTensor* tiltedTensor = nullptr;
     void* imageDev = nullptr;
     void* satDev = nullptr;
     void* sqsumDev = nullptr;
+    void* tiltedDev = nullptr;
     std::vector<int64_t> inShape = {H, W};
     std::vector<int64_t> outShape = {OH, OW};
 
@@ -334,9 +467,28 @@ std::pair<double, double> BenchShape(aclrtStream stream, int64_t H, int64_t W,
     ret = CreateAclTensor(std::vector<OutT>(), outShape, &satDev, outAclType, &satTensor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create sat tensor failed" << std::endl;
               return std::make_pair(-1.0, -1.0));
-    ret = CreateAclTensor(std::vector<float>(), outShape, &sqsumDev, ACL_FLOAT, &sqsumTensor);
-    CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create sqsum tensor failed" << std::endl;
-              return std::make_pair(-1.0, -1.0));
+    if (withSqsum) {
+        ret = CreateAclTensor(std::vector<float>(), outShape, &sqsumDev, ACL_FLOAT, &sqsumTensor);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create sqsum tensor failed" << std::endl;
+                  return std::make_pair(-1.0, -1.0));
+    } else {
+        std::vector<int64_t> emptyShape = {0};
+        std::vector<int64_t> emptyStrides = {0};
+        sqsumTensor = aclCreateTensor(emptyShape.data(), 1, ACL_FLOAT, emptyStrides.data(), 0,
+                                      aclFormat::ACL_FORMAT_ND, emptyShape.data(), 1, nullptr);
+        sqsumDev = nullptr;
+    }
+    if (withTilted) {
+        ret = CreateAclTensor(std::vector<OutT>(), outShape, &tiltedDev, outAclType, &tiltedTensor);
+        CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: create tilted tensor failed" << std::endl;
+                  return std::make_pair(-1.0, -1.0));
+    } else {
+        std::vector<int64_t> emptyShape = {0};
+        std::vector<int64_t> emptyStrides = {0};
+        tiltedTensor = aclCreateTensor(emptyShape.data(), 1, outAclType, emptyStrides.data(), 0,
+                                       aclFormat::ACL_FORMAT_ND, emptyShape.data(), 1, nullptr);
+        tiltedDev = nullptr;
+    }
 
     aclrtEvent startEv = nullptr;
     aclrtEvent endEv = nullptr;
@@ -351,7 +503,7 @@ std::pair<double, double> BenchShape(aclrtStream stream, int64_t H, int64_t W,
     for (int i = 0; i < warmup; i++) {
         uint64_t wsSizeTmp = 0;
         aclOpExecutor* exTmp = nullptr;
-        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, sqsumTensor, &wsSizeTmp,
+        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, sqsumTensor, tiltedTensor, &wsSizeTmp,
                                                 &exTmp);
         CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: GetWorkspaceSize failed: " << ret << std::endl;
                   return std::make_pair(-1.0, -1.0));
@@ -385,7 +537,7 @@ std::pair<double, double> BenchShape(aclrtStream stream, int64_t H, int64_t W,
                   return std::make_pair(-1.0, -1.0));
         uint64_t wsSizeTmp = 0;
         aclOpExecutor* exTmp = nullptr;
-        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, sqsumTensor, &wsSizeTmp,
+        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, sqsumTensor, tiltedTensor, &wsSizeTmp,
                                                 &exTmp);
         CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: GetWorkspaceSize failed: " << ret << std::endl;
                   return std::make_pair(-1.0, -1.0));
@@ -417,7 +569,7 @@ std::pair<double, double> BenchShape(aclrtStream stream, int64_t H, int64_t W,
                   return std::make_pair(-1.0, -1.0));
         uint64_t wsSizeTmp = 0;
         aclOpExecutor* exTmp = nullptr;
-        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, sqsumTensor, &wsSizeTmp,
+        ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, sqsumTensor, tiltedTensor, &wsSizeTmp,
                                                 &exTmp);
         CHECK_RET(ret == ACL_SUCCESS, std::cout << "bench: GetWorkspaceSize failed: " << ret << std::endl;
                   return std::make_pair(-1.0, -1.0));
@@ -453,21 +605,29 @@ std::pair<double, double> BenchShape(aclrtStream stream, int64_t H, int64_t W,
     std::sort(devTimes.begin(), devTimes.end());
     double medE2e = e2eTimes[iters / 2];
     double medDev = devTimes[iters / 2];
-    std::cout << "op integral_image " << typeid(InT).name() << "->" << typeid(OutT).name() << " H=" << H << " W=" << W
-              << ": e2e median=" << medE2e << " us (min=" << e2eTimes.front() << ", max=" << e2eTimes.back()
-              << ", n=" << iters << ")" << std::endl;
-    std::cout << "op integral_image " << typeid(InT).name() << "->" << typeid(OutT).name() << " H=" << H << " W=" << W
-              << ": device median=" << medDev << " us (min=" << devTimes.front() << ", max=" << devTimes.back()
-              << ", n=" << iters << ")" << std::endl;
+    const char* modeName = (mode == 0) ? "sat" : ((mode == 1) ? "sat+sq" : "full");
+    std::cout << "op integral_image[" << modeName << "] " << typeid(InT).name() << "->" << typeid(OutT).name()
+              << " H=" << H << " W=" << W << ": e2e median=" << medE2e << " us (min=" << e2eTimes.front()
+              << ", max=" << e2eTimes.back() << ", n=" << iters << ")" << std::endl;
+    std::cout << "op integral_image[" << modeName << "] " << typeid(InT).name() << "->" << typeid(OutT).name()
+              << " H=" << H << " W=" << W << ": device median=" << medDev << " us (min=" << devTimes.front()
+              << ", max=" << devTimes.back() << ", n=" << iters << ")" << std::endl;
 
     aclrtDestroyEvent(startEv);
     aclrtDestroyEvent(endEv);
     aclDestroyTensor(imageTensor);
     aclDestroyTensor(satTensor);
-    aclDestroyTensor(sqsumTensor);
+    if (withSqsum) {
+        aclDestroyTensor(sqsumTensor);
+    }
+    if (withTilted) {
+        aclDestroyTensor(tiltedTensor);
+    }
     aclrtFree(imageDev);
     aclrtFree(satDev);
-    aclrtFree(sqsumDev);
+    if (withSqsum) {
+        aclrtFree(sqsumDev);
+    }
     return {medE2e, medDev};
 }
 
@@ -475,17 +635,21 @@ int RunBench(aclrtStream stream, int iters)
 {
     // 主口径：uint8 -> int32（与 torch_npu cumsum int32 基线同输出类型、同尺寸）
     int64_t sizes[][2] = {{1024, 1024}, {2048, 2048}, {4096, 4096}};
-    for (auto& s : sizes) {
-        auto t = BenchShape<uint8_t, int32_t>(stream, s[0], s[1], ACL_UINT8, ACL_INT32, iters);
-        if (t.first < 0) {
-            return 1;
+    for (int mode = 0; mode <= 2; mode++) {
+        bool withSq = (mode >= 1);
+        bool withTilt = (mode >= 2);
+        for (auto& s : sizes) {
+            auto t = BenchShape<uint8_t, int32_t>(stream, s[0], s[1], ACL_UINT8, ACL_INT32, iters, withTilt, withSq,
+                                                  mode);
+            if (t.first < 0) {
+                return 1;
+            }
         }
-    }
-    // 附：fp32 -> fp32 同尺寸（可另与 torch cumsum fp32 口径对比）
-    for (auto& s : sizes) {
-        auto t = BenchShape<float, float>(stream, s[0], s[1], ACL_FLOAT, ACL_FLOAT, iters);
-        if (t.first < 0) {
-            return 1;
+        for (auto& s : sizes) {
+            auto t = BenchShape<float, float>(stream, s[0], s[1], ACL_FLOAT, ACL_FLOAT, iters, withTilt, withSq, mode);
+            if (t.first < 0) {
+                return 1;
+            }
         }
     }
     return 0;
@@ -503,9 +667,11 @@ int RunAttrNegativeTests(aclrtStream stream)
         aclTensor* imageTensor = nullptr;
         aclTensor* satTensor = nullptr;
         aclTensor* sqsumTensor = nullptr;
+        aclTensor* tiltedTensor = nullptr;
             void* imageDev = nullptr;
         void* satDev = nullptr;
         void* sqsumDev = nullptr;
+        void* tiltedDev = nullptr;
             std::vector<int64_t> inShape = {H, W};
         std::vector<int64_t> outShape = {H + 1, W + 1};
         CHECK_RET(CreateAclTensor(in, inShape, &imageDev, ACL_FLOAT16, &imageTensor) == ACL_SUCCESS, return 1);
@@ -513,18 +679,23 @@ int RunAttrNegativeTests(aclrtStream stream)
                   return 1);
         CHECK_RET(CreateAclTensor(std::vector<float>(), outShape, &sqsumDev, ACL_FLOAT, &sqsumTensor) == ACL_SUCCESS,
                   return 1);
+        CHECK_RET(CreateAclTensor(std::vector<float>(), outShape, &tiltedDev, ACL_FLOAT, &tiltedTensor) ==
+                      ACL_SUCCESS,
+                  return 1);
         uint64_t ws = 0;
         aclOpExecutor* ex = nullptr;
-        auto r = aclnnIntegralImageGetWorkspaceSize(imageTensor, 0, satTensor, sqsumTensor, &ws, &ex);
+        auto r = aclnnIntegralImageGetWorkspaceSize(imageTensor, 0, satTensor, sqsumTensor, tiltedTensor, &ws, &ex);
         bool ok = (r != ACL_SUCCESS);
         std::cout << (ok ? "[PASS]" : "[FAIL]") << " attr-neg: fp16+sdepth=0 rejected (ret=" << r << ")" << std::endl;
         ret |= ok ? 0 : 1;
         aclDestroyTensor(imageTensor);
         aclDestroyTensor(satTensor);
         aclDestroyTensor(sqsumTensor);
+        aclDestroyTensor(tiltedTensor);
             aclrtFree(imageDev);
         aclrtFree(satDev);
         aclrtFree(sqsumDev);
+        aclrtFree(tiltedDev);
         }
     // u8 输入 + sdepth=2(float64)：910B 暂不支持
     {
@@ -534,9 +705,11 @@ int RunAttrNegativeTests(aclrtStream stream)
         aclTensor* imageTensor = nullptr;
         aclTensor* satTensor = nullptr;
         aclTensor* sqsumTensor = nullptr;
+        aclTensor* tiltedTensor = nullptr;
             void* imageDev = nullptr;
         void* satDev = nullptr;
         void* sqsumDev = nullptr;
+        void* tiltedDev = nullptr;
             std::vector<int64_t> inShape = {H, W};
         std::vector<int64_t> outShape = {H + 1, W + 1};
         CHECK_RET(CreateAclTensor(in, inShape, &imageDev, ACL_UINT8, &imageTensor) == ACL_SUCCESS, return 1);
@@ -544,18 +717,23 @@ int RunAttrNegativeTests(aclrtStream stream)
                   return 1);
         CHECK_RET(CreateAclTensor(std::vector<float>(), outShape, &sqsumDev, ACL_FLOAT, &sqsumTensor) == ACL_SUCCESS,
                   return 1);
+        CHECK_RET(CreateAclTensor(std::vector<float>(), outShape, &tiltedDev, ACL_FLOAT, &tiltedTensor) ==
+                      ACL_SUCCESS,
+                  return 1);
         uint64_t ws = 0;
         aclOpExecutor* ex = nullptr;
-        auto r = aclnnIntegralImageGetWorkspaceSize(imageTensor, 2, satTensor, sqsumTensor, &ws, &ex);
+        auto r = aclnnIntegralImageGetWorkspaceSize(imageTensor, 2, satTensor, sqsumTensor, tiltedTensor, &ws, &ex);
         bool ok = (r != ACL_SUCCESS);
         std::cout << (ok ? "[PASS]" : "[FAIL]") << " attr-neg: u8+sdepth=2 rejected (ret=" << r << ")" << std::endl;
         ret |= ok ? 0 : 1;
         aclDestroyTensor(imageTensor);
         aclDestroyTensor(satTensor);
         aclDestroyTensor(sqsumTensor);
+        aclDestroyTensor(tiltedTensor);
             aclrtFree(imageDev);
         aclrtFree(satDev);
         aclrtFree(sqsumDev);
+        aclrtFree(tiltedDev);
         }
     return ret;
 }
@@ -571,13 +749,45 @@ int RunAll(aclrtStream stream)
         std::vector<uint8_t> in(H * W, 1);
         std::vector<double> exp((H + 1) * (W + 1), 0);
         std::vector<double> expSq((H + 1) * (W + 1), 0);
+        std::vector<double> expTilted;
+        ComputeTiltedRef(in, H, W, expTilted);
         for (int64_t i = 1; i <= H; i++) {
             for (int64_t j = 1; j <= W; j++) {
                 exp[i * (W + 1) + j] = static_cast<double>(i) * j;
                 expSq[i * (W + 1) + j] = static_cast<double>(i) * j;  // 1^2 = 1
             }
         }
-        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp, -1, expSq);
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp, -1, expSq, expTilted);
+    }
+
+    // 用例 1c：uint8 8x64 全 1，tilted 不传（optional 输出为空）——两路模式，验证 sat/sqsum 仍正确
+    {
+        constexpr int64_t H = 8;
+        constexpr int64_t W = 64;
+        std::vector<uint8_t> in(H * W, 1);
+        std::vector<double> exp((H + 1) * (W + 1), 0);
+        std::vector<double> expSq((H + 1) * (W + 1), 0);
+        for (int64_t i = 1; i <= H; i++) {
+            for (int64_t j = 1; j <= W; j++) {
+                exp[i * (W + 1) + j] = static_cast<double>(i) * j;
+                expSq[i * (W + 1) + j] = static_cast<double>(i) * j;
+            }
+        }
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp, -1, expSq, {}, false);
+    }
+
+    // 用例 1d：uint8 8x64 全 1，sqsum 和 tilted 都不传（仅 sat）——OpenCV integral（只 sum）形态
+    {
+        constexpr int64_t H = 8;
+        constexpr int64_t W = 64;
+        std::vector<uint8_t> in(H * W, 1);
+        std::vector<double> exp((H + 1) * (W + 1), 0);
+        for (int64_t i = 1; i <= H; i++) {
+            for (int64_t j = 1; j <= W; j++) {
+                exp[i * (W + 1) + j] = static_cast<double>(i) * j;
+            }
+        }
+        ret |= RunCaseT<uint8_t, int32_t>(stream, H, W, in, ACL_UINT8, ACL_INT32, exp, -1, {}, {}, false, false);
     }
 
     // 用例 1b：uint8 8x64 全 1，sdepth=1 -> float32 输出（OpenCV sdepth 属性：显式指定输出深度）
@@ -921,9 +1131,11 @@ int VerifyShapeT(aclrtStream stream, int64_t H, int64_t W, aclDataType inAclType
     aclTensor* imageTensor = nullptr;
     aclTensor* satTensor = nullptr;
     aclTensor* sqsumTensor = nullptr;
+    aclTensor* tiltedTensor = nullptr;
     void* imageDev = nullptr;
     void* satDev = nullptr;
     void* sqsumDev = nullptr;
+    void* tiltedDev = nullptr;
     std::vector<int64_t> inShape = {H, W};
     std::vector<int64_t> outShape = {OH, OW};
 
@@ -933,10 +1145,12 @@ int VerifyShapeT(aclrtStream stream, int64_t H, int64_t W, aclDataType inAclType
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: create sat tensor failed" << std::endl; return ret);
     ret = CreateAclTensor(std::vector<float>(), outShape, &sqsumDev, ACL_FLOAT, &sqsumTensor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: create sqsum tensor failed" << std::endl; return ret);
+    ret = CreateAclTensor(std::vector<OutT>(), outShape, &tiltedDev, outAclType, &tiltedTensor);
+    CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: create tilted tensor failed" << std::endl; return ret);
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
-    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, sqsumTensor, &workspaceSize,
+    ret = aclnnIntegralImageGetWorkspaceSize(imageTensor, -1, satTensor, sqsumTensor, tiltedTensor, &workspaceSize,
                                             &executor);
     CHECK_RET(ret == ACL_SUCCESS, std::cout << "verify: GetWorkspaceSize failed: " << ret << std::endl; return ret);
     void* workspaceAddr = nullptr;
@@ -992,6 +1206,7 @@ int VerifyShapeT(aclrtStream stream, int64_t H, int64_t W, aclDataType inAclType
     aclDestroyTensor(imageTensor);
     aclDestroyTensor(satTensor);
     aclDestroyTensor(sqsumTensor);
+    aclDestroyTensor(tiltedTensor);
     aclrtFree(imageDev);
     aclrtFree(satDev);
     aclrtFree(sqsumDev);

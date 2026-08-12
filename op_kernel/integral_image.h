@@ -47,9 +47,10 @@ template <typename InT, typename AccT>
 class IntegralImage {
 public:
     __aicore__ inline IntegralImage() {}
-    __aicore__ inline void Init(GM_ADDR image, GM_ADDR sat, GM_ADDR sqsum, GM_ADDR workspace,
+    __aicore__ inline void Init(GM_ADDR image, GM_ADDR sat, GM_ADDR sqsum, GM_ADDR tilted, GM_ADDR workspace,
                                 const IntegralImageTilingData* tilingData);
     __aicore__ inline void Process();
+    __aicore__ inline void ProcessTilted();
 
 private:
     __aicore__ inline void LoadBlock(LocalTensor<InT>& dst, const GlobalTensor<InT>& src, int64_t offset,
@@ -143,8 +144,12 @@ private:
     GlobalTensor<InT> imageGm_;
     GlobalTensor<AccT> satGm_;
     GlobalTensor<float> sqsumGm_;
+    GlobalTensor<AccT> tiltedGm_;
     GlobalTensor<AccT> wsGm_;
     GlobalTensor<float> wsSqGm_;
+    GlobalTensor<AccT> rpGm_;   // tilted row-prefix source (twoPhase: == wsGm_)
+    GlobalTensor<AccT> acc1Gm_; // tilted main-diagonal prefix buffer
+    GlobalTensor<AccT> acc2Gm_; // tilted anti-diagonal prefix buffer
 
     int64_t height_ = 0;
     int64_t width_ = 0;
@@ -157,6 +162,8 @@ private:
     int64_t colTileWidth_ = 0;
     int64_t colTileCount_ = 0;
     int32_t wsValid_ = 0;
+    int32_t sqsumValid_ = 1;
+    int32_t tiltedValid_ = 0;
     int32_t evMte2V_ = 0;
     int32_t evVMte2_ = 0;
     int32_t evMte2S_ = 0;
@@ -169,8 +176,8 @@ private:
 };
 
 template <typename InT, typename AccT>
-__aicore__ inline void IntegralImage<InT, AccT>::Init(GM_ADDR image, GM_ADDR sat, GM_ADDR sqsum, GM_ADDR workspace,
-    const IntegralImageTilingData* tilingData)
+__aicore__ inline void IntegralImage<InT, AccT>::Init(GM_ADDR image, GM_ADDR sat, GM_ADDR sqsum, GM_ADDR tilted,
+    GM_ADDR workspace, const IntegralImageTilingData* tilingData)
 {
     height_ = tilingData->height;
     width_ = tilingData->width;
@@ -185,7 +192,15 @@ __aicore__ inline void IntegralImage<InT, AccT>::Init(GM_ADDR image, GM_ADDR sat
 
     imageGm_.SetGlobalBuffer((__gm__ InT*)image);
     satGm_.SetGlobalBuffer((__gm__ AccT*)sat);
-    sqsumGm_.SetGlobalBuffer((__gm__ float*)sqsum);
+    sqsumValid_ = (tilingData->sqsumEnabled != 0);
+    if (sqsumValid_ != 0) {
+        sqsumGm_.SetGlobalBuffer((__gm__ float*)sqsum);
+    }
+    // Optional tilted output: enabled only when the caller provides it (tiling flag).
+    tiltedValid_ = (tilingData->tiltedEnabled != 0);
+    if (tiltedValid_ != 0) {
+        tiltedGm_.SetGlobalBuffer((__gm__ AccT*)tilted);
+    }
 
     const int32_t blockElems = blockWidth_ * static_cast<int32_t>(channel_);
 
@@ -222,11 +237,22 @@ __aicore__ inline void IntegralImage<InT, AccT>::Init(GM_ADDR image, GM_ADDR sat
     // shared by phase B (colTileW), Process2D (blockWidth) and 3D (blockWidth*C)
     pipe_.InitBuffer(accSqBuf_, blockElems * sizeof(AccT));
     pipe_.InitBuffer(zeroSqBuf_, (blockWidth_ + 8) * sizeof(float));
-    if (twoPhase_ == 1 && workspace != nullptr) {
+    if (workspace != nullptr) {
         // ops-cv custom op convention: the workspace GM_ADDR is the raw user workspace base.
-        wsGm_.SetGlobalBuffer((__gm__ AccT*)workspace);
-        // workspace layout: [0, H*W) sum row prefixes, [H*W, 2*H*W) sqsum row prefixes
-        wsSqGm_.SetGlobalBuffer((__gm__ float*)workspace + height_ * width_);
+        if (twoPhase_ == 1) {
+            // [0,H*W) sum row prefixes, [H*W,2*H*W) sqsum row prefixes,
+            // [2*H*W,3*H*W) tilted acc1, [3*H*W,4*H*W) tilted acc2
+            wsGm_.SetGlobalBuffer((__gm__ AccT*)workspace);
+            wsSqGm_.SetGlobalBuffer((__gm__ float*)workspace + height_ * width_);
+            rpGm_.SetGlobalBuffer((__gm__ AccT*)workspace);
+            acc1Gm_.SetGlobalBuffer((__gm__ AccT*)workspace + 2 * height_ * width_);
+            acc2Gm_.SetGlobalBuffer((__gm__ AccT*)workspace + 3 * height_ * width_);
+        } else {
+            // legacy: [0,H*W) tilted row prefixes, [H*W,2*H*W) acc1, [2*H*W,3*H*W) acc2
+            rpGm_.SetGlobalBuffer((__gm__ AccT*)workspace);
+            acc1Gm_.SetGlobalBuffer((__gm__ AccT*)workspace + height_ * width_);
+            acc2Gm_.SetGlobalBuffer((__gm__ AccT*)workspace + 2 * height_ * width_);
+        }
         wsValid_ = 1;
     }
 
@@ -554,31 +580,46 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
                     LoadBlock2D(imgBatchLocal_, imageGm_, rb * width_ + col, rows, tileW, width_, 0);
                     AscendC::SetFlag<HardEvent::MTE2_S>(evMte2S_);
                     AscendC::WaitFlag<HardEvent::MTE2_S>(evMte2S_);
-                    for (int32_t k = 0; k < rows; k++) {
-                        AccT running = carryVals[k];
-                        float runningSq = carrySqVals[k];
-                        for (int32_t i = 0; i < tileW; i++) {
-                            const AccT v =
-                                static_cast<AccT>(static_cast<int32_t>(imgBatchLocal_.GetValue(k * tileW + i)));
-                            running += v;
-                            runningSq += static_cast<float>(v) * static_cast<float>(v);
-                            dstBatchLocal_.SetValue(k * tileW + i, running);
-                            dstSqBatchLocal_.SetValue(k * tileW + i, runningSq);
+                    if (sqsumValid_ != 0) {
+                        for (int32_t k = 0; k < rows; k++) {
+                            AccT running = carryVals[k];
+                            float runningSq = carrySqVals[k];
+                            for (int32_t i = 0; i < tileW; i++) {
+                                const AccT v =
+                                    static_cast<AccT>(static_cast<int32_t>(imgBatchLocal_.GetValue(k * tileW + i)));
+                                running += v;
+                                runningSq += static_cast<float>(v) * static_cast<float>(v);
+                                dstBatchLocal_.SetValue(k * tileW + i, running);
+                                dstSqBatchLocal_.SetValue(k * tileW + i, runningSq);
+                            }
+                            carryVals[k] = running;
+                            carrySqVals[k] = runningSq;
                         }
-                        carryVals[k] = running;
-                        carrySqVals[k] = runningSq;
+                    } else {
+                        for (int32_t k = 0; k < rows; k++) {
+                            AccT running = carryVals[k];
+                            for (int32_t i = 0; i < tileW; i++) {
+                                const AccT v =
+                                    static_cast<AccT>(static_cast<int32_t>(imgBatchLocal_.GetValue(k * tileW + i)));
+                                running += v;
+                                dstBatchLocal_.SetValue(k * tileW + i, running);
+                            }
+                            carryVals[k] = running;
+                        }
                     }
                     AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
                     AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
                     StoreBlockAcc2D(wsGm_, dstBatchLocal_, rb * width_ + col, rows, tileW, width_, 0);
                     AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
                     AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-                    // dstSqBatch is written by the scalar pipe -> S_MTE3, not V_MTE3
-                    AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
-                    AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
-                    StoreBlockAcc2DF(wsSqGm_, dstSqBatchLocal_, rb * width_ + col, rows, tileW, width_, 0);
-                    AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-                    AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+                    if (sqsumValid_ != 0) {
+                        // dstSqBatch is written by the scalar pipe -> S_MTE3, not V_MTE3
+                        AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
+                        AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
+                        StoreBlockAcc2DF(wsSqGm_, dstSqBatchLocal_, rb * width_ + col, rows, tileW, width_, 0);
+                        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+                        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+                    }
                 } else {
                     // unaligned tail tile: per-row fallback (proven single-row path)
                     for (int32_t k = 0; k < rows; k++) {
@@ -590,28 +631,40 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
                         LoadBlock(imgLocal_, imageGm_, row * width_ + col, tileW);
                         AscendC::SetFlag<HardEvent::MTE2_S>(evMte2S_);
                         AscendC::WaitFlag<HardEvent::MTE2_S>(evMte2S_);
-                        AccT running = carryVals[k];
-                        float runningSq = carrySqVals[k];
-                        for (int32_t i = 0; i < tileW; i++) {
-                            const AccT v = static_cast<AccT>(static_cast<int32_t>(imgLocal_.GetValue(i)));
-                            running += v;
-                            runningSq += static_cast<float>(v) * static_cast<float>(v);
-                            castLocal_.SetValue(i, running);
-                            dstSqBatchLocal_.SetValue(k * rowStride + i, runningSq);
+                        if (sqsumValid_ != 0) {
+                            AccT running = carryVals[k];
+                            float runningSq = carrySqVals[k];
+                            for (int32_t i = 0; i < tileW; i++) {
+                                const AccT v = static_cast<AccT>(static_cast<int32_t>(imgLocal_.GetValue(i)));
+                                running += v;
+                                runningSq += static_cast<float>(v) * static_cast<float>(v);
+                                castLocal_.SetValue(i, running);
+                                dstSqBatchLocal_.SetValue(k * rowStride + i, runningSq);
+                            }
+                            carryVals[k] = running;
+                            carrySqVals[k] = runningSq;
+                        } else {
+                            AccT running = carryVals[k];
+                            for (int32_t i = 0; i < tileW; i++) {
+                                const AccT v = static_cast<AccT>(static_cast<int32_t>(imgLocal_.GetValue(i)));
+                                running += v;
+                                castLocal_.SetValue(i, running);
+                            }
+                            carryVals[k] = running;
                         }
-                        carryVals[k] = running;
-                        carrySqVals[k] = runningSq;
                         AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
                         AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
                         StoreBlock(wsGm_, castLocal_, row * width_ + col, tileW);
                         AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
                         AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-                        // dstSqBatch is written by the scalar pipe -> S_MTE3, not V_MTE3
-                        AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
-                        AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
-                        StoreBlockF(wsSqGm_, dstSqBatchLocal_[k * rowStride], row * width_ + col, tileW);
-                        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-                        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+                        if (sqsumValid_ != 0) {
+                            // dstSqBatch is written by the scalar pipe -> S_MTE3, not V_MTE3
+                            AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
+                            AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
+                            StoreBlockF(wsSqGm_, dstSqBatchLocal_[k * rowStride], row * width_ + col, tileW);
+                            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+                            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+                        }
                     }
                 }
             }
@@ -651,36 +704,44 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
                                                      RoundMode::CAST_NONE, static_cast<uint32_t>(tileW));
                         }
                     }
-                    // sqsum: src^2 -> CumSum (same batch, vector square)
-                    AscendC::Mul(sqSrcBatchLocal_, srcBatch, srcBatch, rows * tileW);
-                    AscendC::CumSum<AccT, kIntegralImageCumSumCfg>(dstSqBatchLocal_, lastRowLocal_,
-                        sqSrcBatchLocal_, AscendC::CumSumInfo{static_cast<uint32_t>(rows),
-                                                              static_cast<uint32_t>(tileW)});
+                    if (sqsumValid_ != 0) {
+                        // sqsum: src^2 -> CumSum (same batch, vector square)
+                        AscendC::Mul(sqSrcBatchLocal_, srcBatch, srcBatch, rows * tileW);
+                        AscendC::CumSum<AccT, kIntegralImageCumSumCfg>(dstSqBatchLocal_, lastRowLocal_,
+                            sqSrcBatchLocal_, AscendC::CumSumInfo{static_cast<uint32_t>(rows),
+                                                                  static_cast<uint32_t>(tileW)});
+                    }
                     AscendC::CumSum<AccT, kIntegralImageCumSumCfg>(dstBatchLocal_, lastRowLocal_, srcBatch,
                         AscendC::CumSumInfo{static_cast<uint32_t>(rows), static_cast<uint32_t>(tileW)});
                     if (col > 0) {
                         for (int32_t k = 0; k < rows; k++) {
                             AscendC::Adds(dstBatchLocal_[k * tileW], dstBatchLocal_[k * tileW], carryVals[k], tileW);
-                            AscendC::Adds(dstSqBatchLocal_[k * tileW], dstSqBatchLocal_[k * tileW], carrySqVals[k],
-                                          tileW);
+                            if (sqsumValid_ != 0) {
+                                AscendC::Adds(dstSqBatchLocal_[k * tileW], dstSqBatchLocal_[k * tileW],
+                                              carrySqVals[k], tileW);
+                            }
                         }
                     }
                     AscendC::SetFlag<HardEvent::V_S>(evVS_);
                     AscendC::WaitFlag<HardEvent::V_S>(evVS_);
                     for (int32_t k = 0; k < rows; k++) {
                         carryVals[k] = dstBatchLocal_.GetValue(k * tileW + tileW - 1);
-                        carrySqVals[k] = dstSqBatchLocal_.GetValue(k * tileW + tileW - 1);
+                        if (sqsumValid_ != 0) {
+                            carrySqVals[k] = dstSqBatchLocal_.GetValue(k * tileW + tileW - 1);
+                        }
                     }
                     AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
                     AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
                     StoreBlockAcc2D(wsGm_, dstBatchLocal_, rb * width_ + col, rows, tileW, width_, 0);
                     AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
                     AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-                    AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-                    AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-                    StoreBlockAcc2DF(wsSqGm_, dstSqBatchLocal_, rb * width_ + col, rows, tileW, width_, 0);
-                    AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-                    AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+                    if (sqsumValid_ != 0) {
+                        AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+                        AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+                        StoreBlockAcc2DF(wsSqGm_, dstSqBatchLocal_, rb * width_ + col, rows, tileW, width_, 0);
+                        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+                        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+                    }
                 } else {
                     // unaligned tail tile: per-row vector CumSum fallback
                     const int32_t innerAligned = ((tileW + 7) / 8) * 8; // float 32B alignment
@@ -699,33 +760,41 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
                             AscendC::SetFlag<HardEvent::V_S>(evVS_);
                             AscendC::WaitFlag<HardEvent::V_S>(evVS_);
                         }
-                        // sqsum row prefix: src^2 -> CumSum
-                        LocalTensor<AccT> sqSrcRow = sqSrcBatchLocal_[k * tileW];
-                        LocalTensor<AccT> dstSqRow = dstSqBatchLocal_[k * tileW];
-                        AscendC::Mul(sqSrcRow, src, src, tileW);
-                        AscendC::CumSum<AccT, kIntegralImageCumSumCfg>(dstSqRow, lastRowLocal_, sqSrcRow,
-                            AscendC::CumSumInfo{1, static_cast<uint32_t>(innerAligned)});
+                        if (sqsumValid_ != 0) {
+                            // sqsum row prefix: src^2 -> CumSum
+                            LocalTensor<AccT> sqSrcRow = sqSrcBatchLocal_[k * tileW];
+                            LocalTensor<AccT> dstSqRow = dstSqBatchLocal_[k * tileW];
+                            AscendC::Mul(sqSrcRow, src, src, tileW);
+                            AscendC::CumSum<AccT, kIntegralImageCumSumCfg>(dstSqRow, lastRowLocal_, sqSrcRow,
+                                AscendC::CumSumInfo{1, static_cast<uint32_t>(innerAligned)});
+                        }
                         AscendC::CumSum<AccT, kIntegralImageCumSumCfg>(leftLocal_, lastRowLocal_, src,
                             AscendC::CumSumInfo{1, static_cast<uint32_t>(innerAligned)});
                         if (col > 0) {
                             AscendC::Adds(leftLocal_, leftLocal_, carryVals[k], tileW);
-                            AscendC::Adds(dstSqBatchLocal_[k * tileW], dstSqBatchLocal_[k * tileW], carrySqVals[k],
-                                          tileW);
+                            if (sqsumValid_ != 0) {
+                                AscendC::Adds(dstSqBatchLocal_[k * tileW], dstSqBatchLocal_[k * tileW],
+                                              carrySqVals[k], tileW);
+                            }
                         }
                         AscendC::SetFlag<HardEvent::V_S>(evVS_);
                         AscendC::WaitFlag<HardEvent::V_S>(evVS_);
                         carryVals[k] = leftLocal_.GetValue(tileW - 1);
-                        carrySqVals[k] = dstSqBatchLocal_.GetValue(k * tileW + tileW - 1);
+                        if (sqsumValid_ != 0) {
+                            carrySqVals[k] = dstSqBatchLocal_.GetValue(k * tileW + tileW - 1);
+                        }
                         AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
                         AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
                         StoreBlock(wsGm_, leftLocal_, row * width_ + col, tileW);
                         AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
                         AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-                        AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-                        AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-                        StoreBlockF(wsSqGm_, dstSqBatchLocal_[k * tileW], row * width_ + col, tileW);
-                        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-                        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+                        if (sqsumValid_ != 0) {
+                            AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+                            AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+                            StoreBlockF(wsSqGm_, dstSqBatchLocal_[k * tileW], row * width_ + col, tileW);
+                            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+                            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+                        }
                     }
                 }
             }
@@ -752,20 +821,24 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
         AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
         AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
 
-        // sqsum zero top row: sqsum[0][colStart .. colStart+tileW] (tile 0 also covers sqsum[0][0])
-        AscendC::Duplicate(zeroSqLocal_, 0.0f, static_cast<int32_t>(colTileW + 8));
-        AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-        AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-        if (tile == 0) {
-            StoreBlockF(sqsumGm_, zeroSqLocal_, 0, tileW + 1);
-        } else {
-            StoreBlockF(sqsumGm_, zeroSqLocal_, colStart + 1, tileW);
+        if (sqsumValid_ != 0) {
+            // sqsum zero top row: sqsum[0][colStart .. colStart+tileW] (tile 0 also covers sqsum[0][0])
+            AscendC::Duplicate(zeroSqLocal_, 0.0f, static_cast<int32_t>(colTileW + 8));
+            AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+            AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+            if (tile == 0) {
+                StoreBlockF(sqsumGm_, zeroSqLocal_, 0, tileW + 1);
+            } else {
+                StoreBlockF(sqsumGm_, zeroSqLocal_, colStart + 1, tileW);
+            }
+            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
         }
-        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
 
         AscendC::Duplicate(accBigLocal_, static_cast<AccT>(0), static_cast<int32_t>(colTileW));
-        AscendC::Duplicate(accSqLocal_, 0.0f, static_cast<int32_t>(colTileW));
+        if (sqsumValid_ != 0) {
+            AscendC::Duplicate(accSqLocal_, 0.0f, static_cast<int32_t>(colTileW));
+        }
         if (tileW % 8 == 0) {
             // ---- batched path: 8 rows per iteration, sync overhead divided by 8 ----
             AscendC::Duplicate(zeroBigLocal_, static_cast<AccT>(0), 8);
@@ -775,39 +848,51 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
                 AscendC::SetFlag<HardEvent::V_MTE2>(evVMte2_);
                 AscendC::WaitFlag<HardEvent::V_MTE2>(evVMte2_);
                 LoadBlockAcc2D(wsBatchLocal_, wsGm_, rb * width_ + colStart, rows, tileW, width_);
-                LoadBlockAcc2DF(wsSqBatchLocal_, wsSqGm_, rb * width_ + colStart, rows, tileW, width_);
+                if (sqsumValid_ != 0) {
+                    LoadBlockAcc2DF(wsSqBatchLocal_, wsSqGm_, rb * width_ + colStart, rows, tileW, width_);
+                }
                 AscendC::SetFlag<HardEvent::MTE2_V>(evMte2V_);
                 AscendC::WaitFlag<HardEvent::MTE2_V>(evMte2V_);
                 if (tile == 0) {
                     for (int32_t k = 0; k < rows; k++) {
                         AscendC::Add(accBigLocal_, accBigLocal_, wsBatchLocal_[k * tileW], tileW);
                         AscendC::Adds(outLocal_[k * tileW], accBigLocal_, static_cast<AccT>(0), tileW);
-                        AscendC::Add(accSqLocal_, accSqLocal_, wsSqBatchLocal_[k * tileW], tileW);
-                        AscendC::Adds(outSqLocal_[k * tileW], accSqLocal_, 0.0f, tileW);
+                        if (sqsumValid_ != 0) {
+                            AscendC::Add(accSqLocal_, accSqLocal_, wsSqBatchLocal_[k * tileW], tileW);
+                            AscendC::Adds(outSqLocal_[k * tileW], accSqLocal_, 0.0f, tileW);
+                        }
                     }
                     AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
                     AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
                     // left column zeros (per-row small stores) + main row segments (batched)
                     for (int32_t k = 0; k < rows; k++) {
                         StoreBlock(satGm_, zeroBigLocal_, (rb + k + 1) * (width_ + 1), 1);
-                        StoreBlockF(sqsumGm_, zeroSqLocal_, (rb + k + 1) * (width_ + 1), 1);
+                        if (sqsumValid_ != 0) {
+                            StoreBlockF(sqsumGm_, zeroSqLocal_, (rb + k + 1) * (width_ + 1), 1);
+                        }
                     }
                     StoreBlockAcc2D(satGm_, outLocal_, (rb + 1) * (width_ + 1) + 1, rows, tileW, width_ + 1, 0);
-                    StoreBlockAcc2DF(sqsumGm_, outSqLocal_, (rb + 1) * (width_ + 1) + 1, rows, tileW,
-                                     width_ + 1, 0);
+                    if (sqsumValid_ != 0) {
+                        StoreBlockAcc2DF(sqsumGm_, outSqLocal_, (rb + 1) * (width_ + 1) + 1, rows, tileW,
+                                         width_ + 1, 0);
+                    }
                 } else {
                     for (int32_t k = 0; k < rows; k++) {
                         AscendC::Add(accBigLocal_, accBigLocal_, wsBatchLocal_[k * tileW], tileW);
                         AscendC::Adds(outLocal_[k * tileW], accBigLocal_, static_cast<AccT>(0), tileW);
-                        AscendC::Add(accSqLocal_, accSqLocal_, wsSqBatchLocal_[k * tileW], tileW);
-                        AscendC::Adds(outSqLocal_[k * tileW], accSqLocal_, 0.0f, tileW);
+                        if (sqsumValid_ != 0) {
+                            AscendC::Add(accSqLocal_, accSqLocal_, wsSqBatchLocal_[k * tileW], tileW);
+                            AscendC::Adds(outSqLocal_[k * tileW], accSqLocal_, 0.0f, tileW);
+                        }
                     }
                     AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
                     AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
                     StoreBlockAcc2D(satGm_, outLocal_, (rb + 1) * (width_ + 1) + colStart + 1, rows, tileW,
                                     width_ + 1, 0);
-                    StoreBlockAcc2DF(sqsumGm_, outSqLocal_, (rb + 1) * (width_ + 1) + colStart + 1, rows, tileW,
-                                     width_ + 1, 0);
+                    if (sqsumValid_ != 0) {
+                        StoreBlockAcc2DF(sqsumGm_, outSqLocal_, (rb + 1) * (width_ + 1) + colStart + 1, rows, tileW,
+                                         width_ + 1, 0);
+                    }
                 }
                 AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
                 AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
@@ -819,24 +904,34 @@ __aicore__ inline void IntegralImage<InT, AccT>::ProcessTwoPhase()
                 AscendC::SetFlag<HardEvent::V_MTE2>(evVMte2_);
                 AscendC::WaitFlag<HardEvent::V_MTE2>(evVMte2_);
                 LoadBlockAcc(wsRowLocal_, wsGm_, r * width_ + colStart, tileW);
-                LoadBlockAccF(wsSqRowLocal_, wsSqGm_, r * width_ + colStart, tileW);
+                if (sqsumValid_ != 0) {
+                    LoadBlockAccF(wsSqRowLocal_, wsSqGm_, r * width_ + colStart, tileW);
+                }
                 AscendC::SetFlag<HardEvent::MTE2_V>(evMte2V_);
                 AscendC::WaitFlag<HardEvent::MTE2_V>(evMte2V_);
                 AscendC::Add(accBigLocal_, accBigLocal_, wsRowLocal_, tileW);
-                AscendC::Add(accSqLocal_, accSqLocal_, wsSqRowLocal_, tileW);
+                if (sqsumValid_ != 0) {
+                    AscendC::Add(accSqLocal_, accSqLocal_, wsSqRowLocal_, tileW);
+                }
                 AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
                 AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
                 if (tile == 0) {
                     // left column zero + main segment
                     StoreBlock(satGm_, zeroBigLocal_, (r + 1) * (width_ + 1), 1);
-                    StoreBlockF(sqsumGm_, zeroSqLocal_, (r + 1) * (width_ + 1), 1);
+                    if (sqsumValid_ != 0) {
+                        StoreBlockF(sqsumGm_, zeroSqLocal_, (r + 1) * (width_ + 1), 1);
+                    }
                     AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
                     AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
                     StoreBlock(satGm_, accBigLocal_, (r + 1) * (width_ + 1) + 1, tileW);
-                    StoreBlockF(sqsumGm_, accSqLocal_, (r + 1) * (width_ + 1) + 1, tileW);
+                    if (sqsumValid_ != 0) {
+                        StoreBlockF(sqsumGm_, accSqLocal_, (r + 1) * (width_ + 1) + 1, tileW);
+                    }
                 } else {
                     StoreBlock(satGm_, accBigLocal_, (r + 1) * (width_ + 1) + colStart + 1, tileW);
-                    StoreBlockF(sqsumGm_, accSqLocal_, (r + 1) * (width_ + 1) + colStart + 1, tileW);
+                    if (sqsumValid_ != 0) {
+                        StoreBlockF(sqsumGm_, accSqLocal_, (r + 1) * (width_ + 1) + colStart + 1, tileW);
+                    }
                 }
                 AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
                 AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
@@ -853,10 +948,11 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process2D()
 
     // zero boundary buffer init (V write, MTE3 read)
     AscendC::Duplicate(zeroBigLocal_, static_cast<AccT>(0), 8 * static_cast<int32_t>(channel_));
-    AscendC::Duplicate(zeroSqLocal_, 0.0f, blockWidth_);
     AscendC::Duplicate(accBigLocal_, static_cast<AccT>(0), blockWidth_);
-    AscendC::Duplicate(accSqLocal_, 0.0f, blockWidth_);
-    AscendC::Duplicate(zeroSqLocal_, 0.0f, blockWidth_);
+    if (sqsumValid_ != 0) {
+        AscendC::Duplicate(accSqLocal_, 0.0f, blockWidth_);
+        AscendC::Duplicate(zeroSqLocal_, 0.0f, blockWidth_);
+    }
     // row 0 zero fill: sat[0][colStart+1 .. colStart+segW]
     AscendC::Duplicate(satLocal_, static_cast<AccT>(0), blockWidth_);
     AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
@@ -864,23 +960,27 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process2D()
     StoreBlock(satGm_, satLocal_, (int64_t)colStart_ + 1, segW);
     AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
     AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-    // row 0 zero fill: sqsum[0][colStart+1 .. colStart+segW]
-    AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-    AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-    StoreBlockF(sqsumGm_, zeroSqLocal_, (int64_t)colStart_ + 1, segW);
-    AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-    AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+    if (sqsumValid_ != 0) {
+        // row 0 zero fill: sqsum[0][colStart+1 .. colStart+segW]
+        AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+        AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+        StoreBlockF(sqsumGm_, zeroSqLocal_, (int64_t)colStart_ + 1, segW);
+        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+    }
     if (colStart_ == 0) {
         AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
         AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
         StoreBlock(satGm_, zeroBigLocal_, 0, 1);
         AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
         AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-        AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-        AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-        StoreBlockF(sqsumGm_, zeroSqLocal_, 0, 1);
-        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+        if (sqsumValid_ != 0) {
+            AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+            AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+            StoreBlockF(sqsumGm_, zeroSqLocal_, 0, 1);
+            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+        }
     }
 
     for (int64_t r = 0; r < height_; r++) {
@@ -895,11 +995,13 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process2D()
             StoreBlock(satGm_, zeroBigLocal_, (r + 1) * (width_ + 1), 1);
             AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
             AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-            AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-            AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-            StoreBlockF(sqsumGm_, zeroSqLocal_, (r + 1) * (width_ + 1), 1);
-            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+            if (sqsumValid_ != 0) {
+                AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+                AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+                StoreBlockF(sqsumGm_, zeroSqLocal_, (r + 1) * (width_ + 1), 1);
+                AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+                AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+            }
         }
 
         // block-start compensation: sum of all left blocks' rows (vector add + scalar tail)
@@ -923,7 +1025,9 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process2D()
             for (int32_t i = 0; i < blockWidth_; i++) {
                 const AccT v = workLeft.GetValue(i);
                 ps += v;
-                psSq += static_cast<float>(v) * static_cast<float>(v);
+                if (sqsumValid_ != 0) {
+                    psSq += static_cast<float>(v) * static_cast<float>(v);
+                }
             }
         }
 
@@ -941,23 +1045,25 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process2D()
             work = imgLocal_;
         }
         CastVec2D(work, imgLocal_, segW);
-        // sqsum row prefix: scalar square accumulation into dstSqBatchLocal_[0] (float32)
-        {
-            LocalTensor<float> sqWork = dstSqBatchLocal_[0];
-            float runningSq = 0.0f;
-            for (int32_t i = 0; i < segW; i++) {
-                const AccT v = work.GetValue(i);
-                runningSq += static_cast<float>(v) * static_cast<float>(v);
-                sqWork.SetValue(i, runningSq);
-            }
-            if (psSq != 0.0f) {
+        if (sqsumValid_ != 0) {
+            // sqsum row prefix: scalar square accumulation into dstSqBatchLocal_[0] (float32)
+            {
+                LocalTensor<float> sqWork = dstSqBatchLocal_[0];
+                float runningSq = 0.0f;
                 for (int32_t i = 0; i < segW; i++) {
-                    sqWork.SetValue(i, sqWork.GetValue(i) + psSq);
+                    const AccT v = work.GetValue(i);
+                    runningSq += static_cast<float>(v) * static_cast<float>(v);
+                    sqWork.SetValue(i, runningSq);
                 }
+                if (psSq != 0.0f) {
+                    for (int32_t i = 0; i < segW; i++) {
+                        sqWork.SetValue(i, sqWork.GetValue(i) + psSq);
+                    }
+                }
+                AscendC::SetFlag<HardEvent::S_V>(evSV_);
+                AscendC::WaitFlag<HardEvent::S_V>(evSV_);
+                AscendC::Add(accSqLocal_, accSqLocal_, sqWork, segW);
             }
-            AscendC::SetFlag<HardEvent::S_V>(evSV_);
-            AscendC::WaitFlag<HardEvent::S_V>(evSV_);
-            AscendC::Add(accSqLocal_, accSqLocal_, sqWork, segW);
         }
         RowScanVec(work, segW);
         if (ps != static_cast<AccT>(0)) {
@@ -975,12 +1081,105 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process2D()
         StoreBlock(satGm_, accBigLocal_, (r + 1) * (width_ + 1) + colStart_ + 1, segW);
         AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
         AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-        // write back sqsum[r+1][colStart+1 .. colStart+segW]
-        AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-        AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-        StoreBlockF(sqsumGm_, accSqLocal_, (r + 1) * (width_ + 1) + colStart_ + 1, segW);
-        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+        if (sqsumValid_ != 0) {
+            // write back sqsum[r+1][colStart+1 .. colStart+segW]
+            AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+            AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+            StoreBlockF(sqsumGm_, accSqLocal_, (r + 1) * (width_ + 1) + colStart_ + 1, segW);
+            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+        }
+    }
+}
+
+// Tilted integral (OpenCV integral3), multi-core diagonal-prefix decomposition:
+//   tilted[y][x] = acc1[y][x] - acc2[y][x], where
+//   acc1[y][x] = sum_{k<=y} rowPrefix[k][x+(y-k)]   (main-diagonal prefix)
+//   acc2[y][x] = sum_{k<=y} rowPrefix[k][x-(y-k)-1] (anti-diagonal prefix)
+// Main and anti diagonals are fully independent -> 40 cores split by diagonal,
+// no cross-core communication, two SyncAll barriers total.
+// Boundaries (defined): tilted[y][W] = 0, tilted[H][*] = 0, first row comes out
+// automatically as src[0][*] (matches OpenCV), first column is the closed-form value.
+template <typename InT, typename AccT>
+__aicore__ inline void IntegralImage<InT, AccT>::ProcessTilted()
+{
+    // Optional output: when the caller does not provide a tilted tensor, skip entirely
+    // (all cores see the same flag, so no SyncAll deadlock).
+    if (tiltedValid_ == 0) {
+        return;
+    }
+    const int64_t blockIdx = AscendC::GetBlockIdx();
+    const int64_t coreNum = AscendC::GetBlockNum();
+    const int64_t plane = height_ * width_;
+    const int64_t OHW = width_ + 1;
+    for (int64_t c = 0; c < channel_; c++) {
+        const int64_t srcOff = c * plane;
+        const int64_t dstOff = c * (height_ + 1) * OHW;
+
+        // T0: row prefixes (legacy path only; two-phase reuses wsGm_/rpGm_)
+        if (twoPhase_ != 1) {
+            for (int64_t row = blockIdx; row < height_; row += coreNum) {
+                AccT run = static_cast<AccT>(0);
+                for (int64_t x = 0; x < width_; x++) {
+                    run += static_cast<AccT>(static_cast<int32_t>(imageGm_.GetValue(srcOff + row * width_ + x)));
+                    rpGm_.SetValue(row * width_ + x, run);
+                }
+            }
+        }
+        AscendC::SyncAll();
+
+        // T1: main-diagonal prefixes acc1 (diagonal u = x+y)
+        for (int64_t u = blockIdx; u < height_ + width_ - 1; u += coreNum) {
+            AccT acc = static_cast<AccT>(0);
+            const int64_t kmax = (u < height_) ? u : (height_ - 1);
+            for (int64_t k = 0; k <= kmax; k++) {
+                const int64_t t = u - k;
+                if (t >= 0) {
+                    acc += (t >= width_) ? rpGm_.GetValue(k * width_ + width_ - 1)
+                                         : rpGm_.GetValue(k * width_ + t);
+                }
+                if (t >= 0 && t < width_) {
+                    acc1Gm_.SetValue(k * width_ + t, acc);
+                }
+            }
+        }
+
+        // T2: anti-diagonal prefixes acc2 (diagonal v = x-y)
+        for (int64_t v = blockIdx - (height_ - 1); v <= width_ - 1; v += coreNum) {
+            AccT acc = static_cast<AccT>(0);
+            for (int64_t y = 0; y < height_; y++) {
+                const int64_t t = v + y - 1;
+                if (t >= 0) {
+                    acc += (t >= width_) ? rpGm_.GetValue(y * width_ + width_ - 1)
+                                         : rpGm_.GetValue(y * width_ + t);
+                }
+                const int64_t x = y + v;
+                if (x >= 0 && x < width_) {
+                    acc2Gm_.SetValue(y * width_ + x, acc);
+                }
+            }
+        }
+        AscendC::SyncAll();
+
+        // T3: merge tilted[row][x] = acc1 - acc2 (row=0..H-1, x=0..W-1).
+        // Row 0 automatically equals src[0][*] (matches OpenCV). Column W and row H are
+        // defined as zero boundaries (OpenCV leaves them undefined).
+        for (int64_t row = blockIdx; row < height_; row += coreNum) {
+            for (int64_t x = 0; x < width_; x++) {
+                const int64_t idx = row * width_ + x;
+                tiltedGm_.SetValue(dstOff + row * OHW + x, acc1Gm_.GetValue(idx) - acc2Gm_.GetValue(idx));
+            }
+        }
+        if (blockIdx == 0) {
+            // right column (x = W) zero for rows 0..H-1, and bottom row (y = H) zero
+            for (int64_t y = 0; y < height_; y++) {
+                tiltedGm_.SetValue(dstOff + y * OHW + width_, static_cast<AccT>(0));
+            }
+            for (int64_t x = 0; x < OHW; x++) {
+                tiltedGm_.SetValue(dstOff + height_ * OHW + x, static_cast<AccT>(0));
+            }
+        }
+        AscendC::SyncAll();
     }
 }
 
@@ -990,15 +1189,18 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process()
     // two-phase path: all launched cores must reach SyncAll (no early return here)
     if (twoPhase_ == 1) {
         ProcessTwoPhase();
+        ProcessTilted();
         return;
     }
     // legacy path: extra cores with colStart beyond width exit early
     if (colStart_ >= width_) {
+        ProcessTilted();
         return;
     }
     // 2D (C == 1) uses the vector fast path; 3D keeps the scalar HWC path
     if (channel_ == 1) {
         Process2D();
+        ProcessTilted();
         return;
     }
     const int32_t blockElems = blockWidth_ * static_cast<int32_t>(channel_);
@@ -1009,7 +1211,9 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process()
 
     AscendC::Duplicate(zeroLocal_, static_cast<AccT>(0), blockWidth_);
     AscendC::Duplicate(accBigLocal_, static_cast<AccT>(0), blockElems);
-    AscendC::Duplicate(accSqLocal_, 0.0f, blockElems);
+    if (sqsumValid_ != 0) {
+        AscendC::Duplicate(accSqLocal_, 0.0f, blockElems);
+    }
     AscendC::Duplicate(zeroBigLocal_, static_cast<AccT>(0), 8 * static_cast<int32_t>(channel_));
 
     // row 0 zero fill: each core writes its own column block sat[0][colStart+1 .. colStart+segW]
@@ -1019,12 +1223,14 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process()
     StoreBlock(satGm_, satLocal_, (static_cast<int64_t>(colStart_) + 1) * channel_, segElems);
     AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
     AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-    // row 0 zero fill: sqsum[0][colStart+1 .. colStart+segW] (all channels)
-    AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-    AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-    StoreBlockF(sqsumGm_, accSqLocal_, (static_cast<int64_t>(colStart_) + 1) * channel_, segElems);
-    AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-    AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+    if (sqsumValid_ != 0) {
+        // row 0 zero fill: sqsum[0][colStart+1 .. colStart+segW] (all channels)
+        AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+        AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+        StoreBlockF(sqsumGm_, accSqLocal_, (static_cast<int64_t>(colStart_) + 1) * channel_, segElems);
+        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+    }
     // core 0 writes sat[0][0..C-1] = 0
     if (colStart_ == 0) {
         AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
@@ -1032,11 +1238,13 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process()
         StoreBlock(satGm_, zeroBigLocal_, 0, static_cast<int32_t>(channel_));
         AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
         AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-        AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-        AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-        StoreBlockF(sqsumGm_, zeroSqLocal_, 0, static_cast<int32_t>(channel_));
-        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+        if (sqsumValid_ != 0) {
+            AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+            AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+            StoreBlockF(sqsumGm_, zeroSqLocal_, 0, static_cast<int32_t>(channel_));
+            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+        }
     }
 
     for (int64_t r = 0; r < height_; r++) {
@@ -1050,17 +1258,21 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process()
             StoreBlock(satGm_, zeroBigLocal_, (r + 1) * (width_ + 1) * channel_, static_cast<int32_t>(channel_));
             AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
             AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
-            AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
-            AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
-            StoreBlockF(sqsumGm_, zeroSqLocal_, (r + 1) * (width_ + 1) * channel_,
-                       static_cast<int32_t>(channel_));
-            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+            if (sqsumValid_ != 0) {
+                AscendC::SetFlag<HardEvent::V_MTE3>(evVMte3_);
+                AscendC::WaitFlag<HardEvent::V_MTE3>(evVMte3_);
+                StoreBlockF(sqsumGm_, zeroSqLocal_, (r + 1) * (width_ + 1) * channel_,
+                           static_cast<int32_t>(channel_));
+                AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+                AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+            }
         }
 
         // 2) block-start compensation: sum + sqsum of all left blocks, per channel independently
         AscendC::Duplicate(prefixLocal_, static_cast<AccT>(0), static_cast<int32_t>(channel_));
-        AscendC::Duplicate(outSqRowLocal_, 0.0f, static_cast<int32_t>(channel_));
+        if (sqsumValid_ != 0) {
+            AscendC::Duplicate(outSqRowLocal_, 0.0f, static_cast<int32_t>(channel_));
+        }
         AscendC::SetFlag<HardEvent::V_S>(evVS_);
         AscendC::WaitFlag<HardEvent::V_S>(evVS_);
         for (int64_t off = 0; off < colStart_; off += blockWidth_) {
@@ -1075,10 +1287,12 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process()
                 prefixLocal_.SetValue(static_cast<int32_t>(c),
                     prefixLocal_.GetValue(static_cast<int32_t>(c)) +
                         SumChannel(imgLocal_, static_cast<int32_t>(c), static_cast<int32_t>(channel_), blockWidth_));
-                outSqRowLocal_.SetValue(static_cast<int32_t>(c),
-                    outSqRowLocal_.GetValue(static_cast<int32_t>(c)) +
-                        SumChannelSq(imgLocal_, static_cast<int32_t>(c), static_cast<int32_t>(channel_),
-                                     blockWidth_));
+                if (sqsumValid_ != 0) {
+                    outSqRowLocal_.SetValue(static_cast<int32_t>(c),
+                        outSqRowLocal_.GetValue(static_cast<int32_t>(c)) +
+                            SumChannelSq(imgLocal_, static_cast<int32_t>(c), static_cast<int32_t>(channel_),
+                                         blockWidth_));
+                }
             }
         }
 
@@ -1117,43 +1331,48 @@ __aicore__ inline void IntegralImage<InT, AccT>::Process()
         AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
         AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
 
-        // 6) sqsum per channel: extract -> scalar square-prefix -> +psSq -> column propagate -> interleave
-        for (int64_t c = 0; c < channel_; c++) {
-            const int32_t ci = static_cast<int32_t>(c);
-            ExtractChannel(castLocal_, imgLocal_, ci, static_cast<int32_t>(channel_), segW);
-            LocalTensor<float> sqWork = dstSqBatchLocal_[0];
-            float runningSq = 0.0f;
-            for (int32_t i = 0; i < segW; i++) {
-                const AccT v = static_cast<AccT>(static_cast<int32_t>(castLocal_.GetValue(i)));
-                runningSq += static_cast<float>(v) * static_cast<float>(v);
-                sqWork.SetValue(i, runningSq);
-            }
-            const float psq = outSqRowLocal_.GetValue(ci);
-            if (psq != 0.0f) {
+        if (sqsumValid_ != 0) {
+            // 6) sqsum per channel: extract -> scalar square-prefix -> +psSq -> column propagate -> interleave
+            for (int64_t c = 0; c < channel_; c++) {
+                const int32_t ci = static_cast<int32_t>(c);
+                ExtractChannel(castLocal_, imgLocal_, ci, static_cast<int32_t>(channel_), segW);
+                LocalTensor<float> sqWork = dstSqBatchLocal_[0];
+                float runningSq = 0.0f;
                 for (int32_t i = 0; i < segW; i++) {
-                    sqWork.SetValue(i, sqWork.GetValue(i) + psq);
+                    const AccT v = static_cast<AccT>(static_cast<int32_t>(castLocal_.GetValue(i)));
+                    runningSq += static_cast<float>(v) * static_cast<float>(v);
+                    sqWork.SetValue(i, runningSq);
                 }
-            }
-            AscendC::SetFlag<HardEvent::S_V>(evSV_);
-            AscendC::WaitFlag<HardEvent::S_V>(evSV_);
-            AscendC::Add(accSqLocal_[ci * blockWidth_], accSqLocal_[ci * blockWidth_], sqWork, segW);
-            AscendC::SetFlag<HardEvent::V_S>(evVS_);
-            AscendC::WaitFlag<HardEvent::V_S>(evVS_);
-            // interleave accSq channel into the float output snapshot (sqsum is fp32)
-            for (int32_t i = 0; i < segW; i++) {
-                dstSqBatchLocal_.SetValue(ci + i * static_cast<int32_t>(channel_),
-                    accSqLocal_.GetValue(ci * blockWidth_ + i));
+                const float psq = outSqRowLocal_.GetValue(ci);
+                if (psq != 0.0f) {
+                    for (int32_t i = 0; i < segW; i++) {
+                        sqWork.SetValue(i, sqWork.GetValue(i) + psq);
+                    }
+                }
+                AscendC::SetFlag<HardEvent::S_V>(evSV_);
+                AscendC::WaitFlag<HardEvent::S_V>(evSV_);
+                AscendC::Add(accSqLocal_[ci * blockWidth_], accSqLocal_[ci * blockWidth_], sqWork, segW);
+                AscendC::SetFlag<HardEvent::V_S>(evVS_);
+                AscendC::WaitFlag<HardEvent::V_S>(evVS_);
+                // interleave accSq channel into the float output snapshot (sqsum is fp32)
+                for (int32_t i = 0; i < segW; i++) {
+                    dstSqBatchLocal_.SetValue(ci + i * static_cast<int32_t>(channel_),
+                        accSqLocal_.GetValue(ci * blockWidth_ + i));
+                }
             }
         }
 
-        // 7) write back the whole block to sqsum main region
-        AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
-        AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
-        StoreBlockF(sqsumGm_, dstSqBatchLocal_,
-            (r + 1) * (width_ + 1) * channel_ + (static_cast<int64_t>(colStart_) + 1) * channel_, segElems);
-        AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
-        AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+        if (sqsumValid_ != 0) {
+            // 7) write back the whole block to sqsum main region
+            AscendC::SetFlag<HardEvent::S_MTE3>(evSMte3_);
+            AscendC::WaitFlag<HardEvent::S_MTE3>(evSMte3_);
+            StoreBlockF(sqsumGm_, dstSqBatchLocal_,
+                (r + 1) * (width_ + 1) * channel_ + (static_cast<int64_t>(colStart_) + 1) * channel_, segElems);
+            AscendC::SetFlag<HardEvent::MTE3_V>(evMte3V_);
+            AscendC::WaitFlag<HardEvent::MTE3_V>(evMte3V_);
+        }
     }
+    ProcessTilted();
 }
 
 } // namespace NsIntegralImage
